@@ -1,0 +1,15 @@
+{
+  "denoise": 1,
+  "denoise_k": 0,
+  "tophat_k": 16,
+  "clahe": 1,
+  "clahe_clip": 0,
+  "clahe_tile": 0,
+  "thr_pct": 993,
+  "clean_k": 1,
+  "open_iter": 0,
+  "close_iter": 1,
+  "min_area": 0,
+  "max_area": 25,
+  "min_circ": 0
+}

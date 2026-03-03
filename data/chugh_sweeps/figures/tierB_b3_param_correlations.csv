@@ -1,0 +1,10 @@
+param,metric,corr
+idf_acc,overall_acc,0.9656637353240665
+idf_acc,overall_precision,0.9644768059858739
+idf_acc,loc_median,-0.9687499999999997
+loc_mean,overall_acc,-0.999959748671093
+loc_mean,overall_precision,-0.9999088367395802
+loc_mean,loc_median,0.9999949371125307
+sla_base_ratio_min,overall_acc,-1.7432284728884244e-16
+sla_base_ratio_min,overall_precision,-1.823211649886123e-16
+sla_base_ratio_min,loc_median,1.8765037600710636e-16

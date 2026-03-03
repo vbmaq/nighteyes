@@ -1,0 +1,19 @@
+
+Winner (highest composite score):
+
+run_id: tierB\b2_081 (sweep b2)
+score: 0.139
+metrics: overall_acc=0.7414, overall_precision=0.8116, loc_median=1.414
+Key params for this run:
+
+matcher=sla
+sla_semantic_prior=True
+sla_semantic_lambda=1.5
+layout_prior=False
+sla_mirror_reject=True
+cand_fallback_percentiles=99,98,97
+cand_fallback_passes=4
+cand_target_raw=8
+support_M=20, support_tol=0.08, support_w=0.1
+ratio_tol=0.1, pivot_P=6, max_seeds=100
+

@@ -1,0 +1,11 @@
+score,run_id,_sweep,overall_acc,overall_precision,loc_median,matcher,layout_prior,sla_semantic_prior,sla_semantic_lambda,sla_layout_prior,sla_mirror_reject,cand_fallback_percentiles,cand_fallback_passes,cand_target_raw,support_M,support_tol,support_w,ratio_tol,pivot_P,max_seeds
+0.139,tierB\b2_081,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,20,0.08,0.1,0.1,6,100
+0.139,tierB\b2_083,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,20,0.08,0.15,0.1,6,100
+0.139,tierB\b2_085,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,20,0.1,0.1,0.1,6,100
+0.139,tierB\b2_087,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,20,0.1,0.15,0.1,6,100
+0.139,tierB\b2_089,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,30,0.08,0.1,0.1,6,100
+0.139,tierB\b2_091,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,30,0.08,0.15,0.1,6,100
+0.139,tierB\b2_093,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,30,0.1,0.1,0.1,6,100
+0.139,tierB\b2_095,b2,0.7414,0.8116,1.414,sla,False,True,1.5,,True,"99,98,97",4,8,30,0.1,0.15,0.1,6,100
+0.1353000000000002,tierB\b2_065,b2,0.7346,0.8147,1.414,sla,False,True,1.5,,True,"99,98,97",2,8,20,0.08,0.1,0.1,6,100
+0.1353000000000002,tierB\b2_067,b2,0.7346,0.8147,1.414,sla,False,True,1.5,,True,"99,98,97",2,8,20,0.08,0.15,0.1,6,100

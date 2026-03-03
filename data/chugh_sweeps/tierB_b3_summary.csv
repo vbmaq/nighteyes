@@ -1,0 +1,10 @@
+run_id,tierb_subtier,tierb_family,ablation_factor,ablation_value,matcher,overall_acc,overall_precision,idf_acc,loc_mean,loc_median,images,gt_present,predicted,correct,runtime_s,ablation_factor,ablation_value,sla_base_ratio_min,sla_layout_prior,sla_mirror_reject,sla_semantic_prior
+tierB\b3_000,,,sla_semantic_prior,False,sla,0.7216,0.7861,0.765,13.236,1.442,2486,8763,8043,6323,nan,sla_semantic_prior,False,0.8,True,True,False
+tierB\b3_001,,,sla_semantic_prior,True,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_semantic_prior,True,0.8,True,True,True
+tierB\b3_002,,,sla_mirror_reject,False,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_mirror_reject,False,0.8,True,False,True
+tierB\b3_003,,,sla_mirror_reject,True,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_mirror_reject,True,0.8,True,True,True
+tierB\b3_004,,,sla_layout_prior,False,sla,0.7381,0.8042,0.768,11.36,1.416,2486,8763,8043,6468,nan,sla_layout_prior,False,0.8,False,True,True
+tierB\b3_005,,,sla_layout_prior,True,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_layout_prior,True,0.8,True,True,True
+tierB\b3_006,,,sla_base_ratio_min,0.75,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_base_ratio_min,0.75,0.75,True,True,True
+tierB\b3_007,,,sla_base_ratio_min,0.8,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_base_ratio_min,0.8,0.8,True,True,True
+tierB\b3_008,,,sla_base_ratio_min,0.85,sla,0.7379,0.8039,0.769,11.366,1.416,2486,8763,8043,6466,nan,sla_base_ratio_min,0.85,0.85,True,True,True

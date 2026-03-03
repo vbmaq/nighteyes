@@ -1,0 +1,8 @@
+# Minimal deps for the glint pipeline UIs + core pipeline
+numpy
+opencv-python
+Pillow
+scipy
+tqdm
+joblib
+matplotlib
