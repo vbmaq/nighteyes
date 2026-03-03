@@ -1,0 +1,115 @@
+{
+  "base": {
+    "template_mode": "bank",
+    "score2_mode": "contrast_support",
+    "cand_fallback": true,
+    "cand_target_raw": 12,
+    "cand_fallback_passes": 4,
+    "cand_fallback_percentiles": "99.5,99,98.5,98",
+    "support_M": 30,
+    "support_tol": 0.1,
+    "support_w": 0.15,
+    "ratio_tol": 0.12,
+    "pivot_P": 8,
+    "max_seeds": 200,
+    "matching": "greedy",
+    "matcher": "sla",
+    "sla_layout_prior": true,
+    "sla_layout_lambda": 0.25,
+    "sla_layout_mode": "image",
+    "sla_scale_min": 0.01,
+    "sla_scale_max": 500,
+    "sla_semantic_prior": true,
+    "sla_semantic_lambda": 1.5,
+    "sla_mirror_reject": true,
+    "sla_base_ratio_min": 0.8,
+    "sla_side_margin": 0.0,
+    "sla_top2_margin": 0.0
+  },
+  "vary": {},
+  "zip_only": true,
+  "zip": [
+    [
+      "ablation_factor",
+      "ablation_value",
+      "sla_semantic_prior",
+      "sla_mirror_reject",
+      "sla_layout_prior",
+      "sla_base_ratio_min"
+    ],
+    [
+      [
+        "sla_semantic_prior",
+        false,
+        false,
+        true,
+        true,
+        0.8
+      ],
+      [
+        "sla_semantic_prior",
+        true,
+        true,
+        true,
+        true,
+        0.8
+      ],
+      [
+        "sla_mirror_reject",
+        false,
+        true,
+        false,
+        true,
+        0.8
+      ],
+      [
+        "sla_mirror_reject",
+        true,
+        true,
+        true,
+        true,
+        0.8
+      ],
+      [
+        "sla_layout_prior",
+        false,
+        true,
+        true,
+        false,
+        0.8
+      ],
+      [
+        "sla_layout_prior",
+        true,
+        true,
+        true,
+        true,
+        0.8
+      ],
+      [
+        "sla_base_ratio_min",
+        0.75,
+        true,
+        true,
+        true,
+        0.75
+      ],
+      [
+        "sla_base_ratio_min",
+        0.8,
+        true,
+        true,
+        true,
+        0.8
+      ],
+      [
+        "sla_base_ratio_min",
+        0.85,
+        true,
+        true,
+        true,
+        0.85
+      ]
+    ]
+  ]
+}

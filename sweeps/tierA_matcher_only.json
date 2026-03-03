@@ -1,0 +1,23 @@
+﻿{
+  "base": {
+    "template_mode": "bank",
+    "score2_mode": "contrast_support",
+    "support_M": 30,
+    "support_tol": 0.10,
+    "support_w": 0.15,
+    "cand_fallback": true,
+    "cand_target_raw": 12,
+    "cand_fallback_passes": 4,
+    "cand_fallback_percentiles": "99.5,99,98.5,98",
+    "matching": "greedy",
+    "sla_scale_min": 0.01,
+    "sla_scale_max": 500
+  },
+  "vary": {
+    "matcher": ["ransac", "hybrid", "sla"],
+    "matching": ["greedy", "hungarian"],
+    "ratio_tol": [0.10, 0.12],
+    "pivot_P": [6, 8],
+    "max_seeds": [100]
+  }
+}
