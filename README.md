@@ -152,6 +152,6 @@ This repository builds on ideas from constellation matching and star identificat
 
 
 ## Literature
-[1] Garbin, S. J., Shen, Y., Schuetz, I., Cavin, R., Hughes, G., & Talathi, S. S. (2019). Openeds: Open eye dataset. arXiv preprint arXiv:1905.03702.
-[2] Palmero, C., Sharma, A., Behrendt, K., Krishnakumar, K., Komogortsev, O. V., & Talathi, S. S. (2020). Openeds2020: Open eyes dataset. arXiv preprint arXiv:2005.03876.
-[3] Chugh, S., Brousseau, B., Rose, J., & Eizenman, M. (2021, January). Detection and correspondence matching of corneal reflections for eye tracking using deep learning. In 2020 25th international conference on pattern recognition (ICPR) (pp. 2210-2217). IEEE.
+* [1] Garbin, S. J., Shen, Y., Schuetz, I., Cavin, R., Hughes, G., & Talathi, S. S. (2019). Openeds: Open eye dataset. arXiv preprint arXiv:1905.03702.
+* [2] Palmero, C., Sharma, A., Behrendt, K., Krishnakumar, K., Komogortsev, O. V., & Talathi, S. S. (2020). Openeds2020: Open eyes dataset. arXiv preprint arXiv:2005.03876.
+* [3] Chugh, S., Brousseau, B., Rose, J., & Eizenman, M. (2021, January). Detection and correspondence matching of corneal reflections for eye tracking using deep learning. In 2020 25th international conference on pattern recognition (ICPR) (pp. 2210-2217). IEEE.
