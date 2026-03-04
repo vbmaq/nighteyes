@@ -1,8 +1,10 @@
-# Glint Constellation Pipeline (paperReady)
+# Glint Constellation Pipeline (`paperReady`)
 
-This branch is a publication-oriented artifact focused on the glint pipeline UIs and the underlying per-image detection + constellation matching pipeline.
+This repository contains the Glint Constellation pipeline: a set of UIs plus the underlying per-image detection and constellation-matching code. 
 
-## Intent-Based Layout
+For a quick start, see **Install** and **Run** below.
+
+## Repository Layout
 - `glint_pipeline/`: core pipeline + small helper modules (importable)
 - `apps/`: UI implementations
 - `tools/`: plotting / dataset conversion utilities
@@ -11,20 +13,21 @@ This branch is a publication-oriented artifact focused on the glint pipeline UIs
 - `data/`: results / templates / example assets
 
 ## Entry Points (Backwards Compatible)
+The following scripts are thin wrappers (to preserve older entry points):
 - Preview/tuning UI: `glint_pipeline_preview_ui.py` (wrapper -> `apps/`)
 - Annotation review/correction UI: `glint_pupil_annotation_review_ui.py` (wrapper -> `apps/`)
 - Manual template maker UI: `templatemaker_manual.py` (wrapper -> `apps/`)
 - Core pipeline (CLI + library): `glint_pipeline_eval_gen.py` (wrapper -> `glint_pipeline/`)
 
-## Data And Templates
+## Data and Templates
 - Dataset / results are kept under `data/`.
 - Default template bank is loaded from `templates/default_templates.json` when `--template_bank_source default` is used.
   - If you use a custom bank, pass `--template_bank_source custom --template_bank_path <path>`.
 
 ## Install
-Use your existing environment, or install minimal dependencies:
+Use an existing environment, or install the minimal dependencies:
 ```bash
-python -m pip install -r requirements-paperready.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Run
