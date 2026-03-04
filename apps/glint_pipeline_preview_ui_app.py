@@ -11,6 +11,7 @@ import types
 import tempfile
 import zipfile
 import shutil
+import time
 
 from glint_pipeline import eval_gen as g
 from glint_pipeline.temporal import MultiGlintTracker
@@ -304,7 +305,10 @@ class PreviewApp:
         self.idx = 0
         self.playing = False
         self.after_id = None
+        self.render_request_id = None
         self.photo = None
+        self.canvas_image_id = None
+        self.canvas_size = None
         self.zoom = 1.0
         self.mirror = False
         self.template = None
@@ -342,6 +346,14 @@ class PreviewApp:
         self.cache_progress_var = tk.DoubleVar(value=0.0)
         self.save_workers_var = tk.IntVar(value=0)
         self.default_settings_path = Path(r"C:\Users\vbmaq\Documents\virnet2\data\templates\chugh\preview_ui_settings_b2_081_win.json")
+        self.current_preview_base = None
+        self.current_preview_base_name = None
+        self.current_preview_base_cache_key = None
+        self.args_dirty = True
+        self.args_cached = None
+        self.args_cached_key = None
+        self.ondemand_lock = threading.Lock()
+        self.ondemand_inflight = set()
 
         self._build_ui()
         if self.default_settings_path.exists():
@@ -380,7 +392,7 @@ class PreviewApp:
         ttk.Label(top, text="Save workers").pack(side=tk.LEFT, padx=(10, 2))
         ttk.Entry(top, textvariable=self.save_workers_var, width=4).pack(side=tk.LEFT)
         self.mirror_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="Mirror", variable=self.mirror_var, command=self.render_current).pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(top, text="Mirror", variable=self.mirror_var, command=self._request_render).pack(side=tk.LEFT, padx=6)
         self.play_btn = ttk.Button(top, text="Play", command=self.toggle_play)
         self.play_btn.pack(side=tk.LEFT, padx=3)
         self.status_var = tk.StringVar(value="No folder loaded.")
@@ -573,6 +585,259 @@ class PreviewApp:
         except Exception:
             pass
 
+    def _request_render(self, delay_ms: int = 0) -> None:
+        if self.render_request_id is not None:
+            try:
+                self.root.after_cancel(self.render_request_id)
+            except Exception:
+                pass
+        self.render_request_id = self.root.after(int(delay_ms), self._run_requested_render)
+
+    def _run_requested_render(self) -> None:
+        self.render_request_id = None
+        self.render_current()
+
+    def _set_canvas_rgb(self, rgb: np.ndarray) -> None:
+        if self.zoom != 1.0:
+            z = float(self.zoom)
+            rgb = cv2.resize(
+                rgb,
+                (int(rgb.shape[1] * z), int(rgb.shape[0] * z)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        img = Image.fromarray(rgb)
+        self.photo = ImageTk.PhotoImage(img)
+        if self.canvas_size != (img.width, img.height):
+            self.canvas_size = (img.width, img.height)
+            self.canvas.config(width=img.width, height=img.height, scrollregion=(0, 0, img.width, img.height))
+        if self.canvas_image_id is None:
+            self.canvas_image_id = self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
+        else:
+            self.canvas.itemconfig(self.canvas_image_id, image=self.photo)
+
+    def _overrides_key(self, name: str):
+        overrides = self.overrides_by_image.get(name)
+        if not overrides:
+            return None
+        items = []
+        for ti, (x, y) in overrides.items():
+            try:
+                items.append((int(ti), round(float(x), 3), round(float(y), 3)))
+            except Exception:
+                continue
+        items.sort()
+        return tuple(items) if items else None
+
+    def _apply_overrides(self, name: str, cand_xy: np.ndarray, matches, T_hat):
+        overrides = self.overrides_by_image.get(name, {})
+        cand_xy_disp = cand_xy.copy() if isinstance(cand_xy, np.ndarray) else np.array(cand_xy, dtype=float)
+        matches_disp = list(matches) if matches is not None else []
+        if overrides and T_hat is not None:
+            for ti, pt in overrides.items():
+                x, y = pt
+                cand_xy_disp = np.vstack([cand_xy_disp, np.array([[x, y]], dtype=float)])
+                new_ci = len(cand_xy_disp) - 1
+                d = float(np.linalg.norm(T_hat[int(ti)] - cand_xy_disp[new_ci]))
+                replaced = False
+                for mi, (tti, _, _) in enumerate(matches_disp):
+                    if int(tti) == int(ti):
+                        matches_disp[mi] = (int(ti), int(new_ci), d)
+                        replaced = True
+                        break
+                if not replaced:
+                    matches_disp.append((int(ti), int(new_ci), d))
+        return cand_xy_disp, matches_disp
+
+    def _ensure_current_preview_base(self, fp: Path, args, cache_key: str) -> np.ndarray:
+        if (
+            self.current_preview_base is not None
+            and self.current_preview_base_name == fp.name
+            and self.current_preview_base_cache_key == cache_key
+        ):
+            return self.current_preview_base
+        bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError(f"Failed to read image: {fp}")
+        if bool(getattr(args, "mirror", False)):
+            bgr = cv2.flip(bgr, 1)
+        gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        params = g.scale_params_for_image(args, w=gray_full.shape[1], h=gray_full.shape[0])
+        preview_base = gray_full
+        if getattr(args, "preview_enhanced", False):
+            kernel_eff = int(params["kernel_eff"])
+            median_ksize_eff = int(params["median_ksize_eff"])
+            preview_base = g.enhance_for_glints(
+                gray_full,
+                kernel_size=kernel_eff,
+                median_ksize=median_ksize_eff,
+                clahe_clip=args.clahe_clip,
+                clahe_tiles=args.clahe_tiles,
+                denoise=int(getattr(args, "denoise", 1)),
+                denoise_k=int(getattr(args, "denoise_k", 0)),
+                clahe_enable=int(getattr(args, "clahe", 1)),
+                gamma=float(getattr(args, "gamma", 1.0)),
+                unsharp=int(getattr(args, "unsharp", 0)),
+                unsharp_amount=float(getattr(args, "unsharp_amount", 1.0)),
+                unsharp_sigma=float(getattr(args, "unsharp_sigma", 1.0)),
+                enhance_mode=str(getattr(args, "enhance_mode", "tophat")),
+                dog_sigma1=float(getattr(args, "dog_sigma1", 1.0)),
+                dog_sigma2=float(getattr(args, "dog_sigma2", 2.2)),
+                minmax=int(getattr(args, "minmax", 1)),
+                enhance_enable=int(getattr(args, "enhance_enable", 1)),
+            )
+        self.current_preview_base = preview_base
+        self.current_preview_base_name = fp.name
+        self.current_preview_base_cache_key = cache_key
+        return preview_base
+
+    def _quick_preview_rgb(self, fp: Path, args, cache_key: str) -> np.ndarray | None:
+        bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+        if bgr is None:
+            return None
+        if bool(getattr(args, "mirror", False)):
+            bgr = cv2.flip(bgr, 1)
+        gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        self.current_preview_base = gray_full
+        self.current_preview_base_name = fp.name
+        self.current_preview_base_cache_key = cache_key
+        return cv2.cvtColor(gray_full, cv2.COLOR_GRAY2RGB)
+
+    def _start_ondemand_cache_compute(self, fp: Path, frame_idx: int, args, cache_key: str) -> None:
+        key = (cache_key, fp.name)
+        with self.ondemand_lock:
+            if len(self.ondemand_inflight) >= 2:
+                return
+            if key in self.ondemand_inflight:
+                return
+            self.ondemand_inflight.add(key)
+
+        args_snapshot = types.SimpleNamespace(**vars(args))
+
+        def worker():
+            try:
+                template, bank_templates, ratio_index_bank, ratio_index_single, d_expected = self._prepare_templates_local(args_snapshot)
+                pupil_npz_map = self.pupil_npz_map
+                pupil_radii_raw = [int(x) for x in str(getattr(args_snapshot, "pupil_radii", "")).split(",") if x.strip().isdigit()]
+                if not pupil_radii_raw:
+                    pupil_radii_raw = [12, 16, 20, 24, 28, 32]
+                cache_state = {
+                    "template": template,
+                    "bank_templates": bank_templates,
+                    "ratio_index_bank": ratio_index_bank,
+                    "ratio_index_single": ratio_index_single,
+                    "d_expected": d_expected,
+                    "prev_params": None,
+                    "temporal_tracker": None,
+                    "last_good_pupil": None,
+                    "pupil_npz_map": pupil_npz_map,
+                    "pupil_radii_raw": pupil_radii_raw,
+                }
+                entry = self._compute_cache_entry(fp, frame_idx, args_snapshot, cache_state)
+                if entry is None:
+                    return
+                if cache_key != self.cache_key:
+                    return
+                with self.cache_lock:
+                    # Don't clobber a fresher entry if it already exists.
+                    self.frame_cache.setdefault(fp.name, entry)
+            finally:
+                with self.ondemand_lock:
+                    self.ondemand_inflight.discard(key)
+                try:
+                    self.root.after(0, self._request_render)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_overlay_for_entry(self, fp: Path, entry: dict, args, cache_key: str) -> None:
+        overrides_key = self._overrides_key(fp.name)
+        mode = "corr" if self.corr_mode.get() else "normal"
+        if (
+            entry.get("overlay_key") == overrides_key
+            and entry.get("overlay_mode") == mode
+            and entry.get("overlay_rgb") is not None
+        ):
+            return
+
+        preview_base = self._ensure_current_preview_base(fp, args, cache_key)
+        cand_xy_base = entry.get("cand_xy_base")
+        matches_base = entry.get("matches_base")
+        T_hat = entry.get("T_hat")
+        tracked_xy = entry.get("tracked_xy")
+
+        if cand_xy_base is None:
+            raise RuntimeError("Cache entry missing cand_xy_base")
+
+        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy_base, matches_base, T_hat)
+
+        title = f"{fp.name} | matcher={args.matcher} | inliers={entry.get('inliers', 0)} | err={entry.get('mean_err', float('nan')):.2f}px"
+        if args.temporal:
+            title += " | temporal"
+
+        if not args.show_overlay:
+            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
+            if args.pupil_roi_debug and entry.get("roi_rect") is not None:
+                ox, oy, sz = entry["roi_rect"]
+                cv2.rectangle(
+                    overlay,
+                    (int(round(ox)), int(round(oy))),
+                    (int(round(ox + sz)), int(round(oy + sz))),
+                    (0, 200, 255),
+                    2,
+                )
+            overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            entry["overlay_rgb"] = overlay_rgb
+            entry["cand_xy"] = cand_xy_disp
+            entry["matches"] = matches_disp
+            entry["overlay_key"] = overrides_key
+            entry["overlay_mode"] = mode
+            return
+
+        matches_draw = matches_disp
+        T_hat_draw = T_hat
+        use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
+        if use_temporal_display and tracked_xy is not None:
+            if np.isfinite(tracked_xy).any():
+                T_hat_draw = tracked_xy
+                T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
+            matches_draw = []
+
+        overlay = g.draw_overlay(
+            preview_base,
+            cand_xy_disp,
+            T_hat_draw,
+            matches_draw,
+            title_text=title,
+            gt_xy=None,
+            match_tol=args.match_tol,
+        )
+        if args.pupil_roi_debug and entry.get("roi_rect") is not None:
+            ox, oy, sz = entry["roi_rect"]
+            cv2.rectangle(
+                overlay,
+                (int(round(ox)), int(round(oy))),
+                (int(round(ox + sz)), int(round(oy + sz))),
+                (0, 200, 255),
+                2,
+            )
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        entry["overlay_rgb"] = overlay_rgb
+        entry["cand_xy"] = cand_xy_disp
+        entry["matches"] = matches_disp if self.corr_mode.get() else matches_draw
+        entry["overlay_key"] = overrides_key
+        entry["overlay_mode"] = mode
+
+    def _get_args_and_cache_key(self):
+        if not self.args_dirty and self.args_cached is not None and self.args_cached_key is not None:
+            return self.args_cached, self.args_cached_key
+        args = self._get_args()
+        cache_key = self._settings_cache_key(args)
+        self.args_cached = args
+        self.args_cached_key = cache_key
+        self.args_dirty = False
+        return args, cache_key
+
     def _get_args(self):
         # Build a Namespace compatible with g.run_matcher_for_template and helpers
         args = type("Args", (), {})()
@@ -741,6 +1006,7 @@ class PreviewApp:
         return json.dumps(cfg, sort_keys=True, default=str)
 
     def _on_settings_change(self, *_args) -> None:
+        self.args_dirty = True
         self._schedule_cache_rebuild()
 
     def _schedule_cache_rebuild(self) -> None:
@@ -801,6 +1067,8 @@ class PreviewApp:
                     if entry is not None:
                         with self.cache_lock:
                             self.frame_cache[fp.name] = entry
+                    if (i + 1) % 2 == 0:
+                        time.sleep(0)
                     if (i + 1) % 10 == 0 or i + 1 == total:
                         pct = int(round((i + 1) * 100.0 / max(total, 1)))
                         self.root.after(0, lambda p=pct, a=i + 1, t=total: self.status_var.set(
@@ -811,7 +1079,7 @@ class PreviewApp:
                 if token == self.cache_token:
                     self.cache_building = False
                     self.root.after(0, lambda: self.cache_progress_var.set(100.0))
-                    self.root.after(0, self.render_current)
+                    self.root.after(0, self._request_render)
 
         self.cache_thread = threading.Thread(target=worker, daemon=True)
         self.cache_thread.start()
@@ -1058,24 +1326,6 @@ class PreviewApp:
             if args.temporal:
                 cache_state["prev_params"] = g.extract_similarity_params(best_template_xy, best)
 
-        overrides = self.overrides_by_image.get(fp.name, {})
-        cand_xy_disp = cand_xy.copy() if isinstance(cand_xy, np.ndarray) else np.array(cand_xy, dtype=float)
-        matches_disp = list(matches) if matches is not None else []
-        if overrides and T_hat is not None:
-            for ti, pt in overrides.items():
-                x, y = pt
-                cand_xy_disp = np.vstack([cand_xy_disp, np.array([[x, y]], dtype=float)])
-                new_ci = len(cand_xy_disp) - 1
-                d = float(np.linalg.norm(T_hat[int(ti)] - cand_xy_disp[new_ci]))
-                replaced = False
-                for mi, (tti, _, _) in enumerate(matches_disp):
-                    if int(tti) == int(ti):
-                        matches_disp[mi] = (int(ti), int(new_ci), d)
-                        replaced = True
-                        break
-                if not replaced:
-                    matches_disp.append((int(ti), int(new_ci), d))
-
         tracked_xy = None
         if args.temporal:
             if cache_state["temporal_tracker"] is None:
@@ -1085,28 +1335,51 @@ class PreviewApp:
                     max_missed=args.temporal_max_missed,
                 )
             meas_labeled = np.full((4, 2), np.nan, dtype=float)
-            for ti, ci, _ in matches_disp:
+            for ti, ci, _ in (matches or []):
                 if int(ti) >= 4:
                     continue
-                meas_labeled[int(ti)] = cand_xy_disp[int(ci)]
-            if not np.isfinite(meas_labeled).any() and len(cand_xy_disp) > 0:
-                k = min(4, len(cand_xy_disp))
-                meas_labeled[:k] = cand_xy_disp[:k]
+                meas_labeled[int(ti)] = cand_xy[int(ci)]
+            if not np.isfinite(meas_labeled).any() and len(cand_xy) > 0:
+                k = min(4, len(cand_xy))
+                meas_labeled[:k] = cand_xy[:k]
             if not np.isfinite(meas_labeled).any() and T_hat is not None and T_hat.shape[0] >= 4:
                 meas_labeled[:4] = T_hat[:4]
             tracked_xy, _meta = cache_state["temporal_tracker"].step_labeled(meas_labeled, frame_idx)
 
+        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
+
         title = f"{fp.name} | matcher={args.matcher} | inliers={inliers} | err={mean_err:.2f}px"
         if args.temporal:
             title += " | temporal"
+        roi_rect = None
+        if roi_info is not None:
+            roi_rect = (float(roi_info.offset_x), float(roi_info.offset_y), float(int(args.pupil_roi_size)))
 
         if not args.show_overlay:
             overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
+            if args.pupil_roi_debug and roi_rect is not None:
+                ox, oy, sz = roi_rect
+                cv2.rectangle(
+                    overlay,
+                    (int(round(ox)), int(round(oy))),
+                    (int(round(ox + sz)), int(round(oy + sz))),
+                    (0, 200, 255),
+                    2,
+                )
             overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
             return {
                 "overlay_rgb": overlay_rgb,
                 "matches": matches_disp,
                 "cand_xy": cand_xy_disp,
+                "cand_xy_base": cand_xy,
+                "matches_base": matches,
+                "T_hat": T_hat,
+                "tracked_xy": tracked_xy,
+                "inliers": inliers,
+                "mean_err": mean_err,
+                "roi_rect": roi_rect,
+                "overlay_key": self._overrides_key(fp.name),
+                "overlay_mode": "normal",
             }
 
         matches_draw = matches_disp
@@ -1117,11 +1390,29 @@ class PreviewApp:
                 T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
             matches_draw = []
         overlay = g.draw_overlay(preview_base, cand_xy_disp, T_hat_draw, matches_draw, title_text=title, gt_xy=None, match_tol=args.match_tol)
+        if args.pupil_roi_debug and roi_rect is not None:
+            ox, oy, sz = roi_rect
+            cv2.rectangle(
+                overlay,
+                (int(round(ox)), int(round(oy))),
+                (int(round(ox + sz)), int(round(oy + sz))),
+                (0, 200, 255),
+                2,
+            )
         overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         return {
             "overlay_rgb": overlay_rgb,
             "matches": matches_draw,
             "cand_xy": cand_xy_disp,
+            "cand_xy_base": cand_xy,
+            "matches_base": matches,
+            "T_hat": T_hat,
+            "tracked_xy": tracked_xy,
+            "inliers": inliers,
+            "mean_err": mean_err,
+            "roi_rect": roi_rect,
+            "overlay_key": self._overrides_key(fp.name),
+            "overlay_mode": "normal",
         }
 
     def _invalidate_cache_for_frame(self, name: str) -> None:
@@ -1137,6 +1428,7 @@ class PreviewApp:
         if not path:
             return
         self.templates_path = path
+        self.args_dirty = True
         self.cfg_var.set(f"templates: {Path(path).name}")
         self._start_template_prep()
 
@@ -1148,8 +1440,9 @@ class PreviewApp:
         if not path:
             return
         self.image_config_path = path
+        self.args_dirty = True
         self.cfg_var.set(f"image_config: {Path(path).name}")
-        self.render_current()
+        self._request_render()
         self._schedule_cache_rebuild()
 
     def load_pupil_npz(self) -> None:
@@ -1171,11 +1464,12 @@ class PreviewApp:
             def apply_loaded():
                 self.pupil_npz_map = pupil_map
                 self.pupil_npz_path = path
+                self.args_dirty = True
                 # Avoid UI "freeze" if filenames don't match: fall back to full frame.
                 if "pupil_roi_fail_policy" in self.vars:
                     self.vars["pupil_roi_fail_policy"].set("full_frame")
                 self.cfg_var.set(f"pupil_npz: {Path(path).name}")
-                self.render_current()
+                self._request_render()
                 self._schedule_cache_rebuild()
             self.root.after(0, apply_loaded)
 
@@ -1221,13 +1515,14 @@ class PreviewApp:
         self.templates_path = data.get("templates_path")
         self.image_config_path = data.get("image_config_path")
         self.pupil_npz_path = data.get("pupil_npz_path")
+        self.args_dirty = True
         if self.pupil_npz_path:
             try:
                 self.pupil_npz_map = g.load_pupil_npz(self.pupil_npz_path)
             except Exception as exc:
                 messagebox.showerror("Error", f"Failed to load pupil NPZ: {exc}")
         self.cfg_var.set(f"settings: {Path(in_path).name}")
-        self.render_current()
+        self._request_render()
         self._schedule_cache_rebuild()
 
     def load_folder(self) -> None:
@@ -1308,7 +1603,7 @@ class PreviewApp:
             except Exception as exc:
                 self.root.after(0, lambda exc=exc: messagebox.showerror("Error", f"Template prep failed: {exc}"))
                 return
-            self.root.after(0, self.render_current)
+            self.root.after(0, self._request_render)
             self.root.after(0, self._schedule_cache_rebuild)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1550,24 +1845,7 @@ class PreviewApp:
         else:
             self.template_by_image[fp.name] = np.full((best_template_xy.shape[0], 2), np.nan, dtype=float)
 
-        # apply manual corrections for display
-        overrides = self.overrides_by_image.get(fp.name, {})
-        cand_xy_disp = cand_xy.copy() if isinstance(cand_xy, np.ndarray) else np.array(cand_xy, dtype=float)
-        matches_disp = list(matches) if matches is not None else []
-        if overrides and T_hat is not None:
-            for ti, pt in overrides.items():
-                x, y = pt
-                cand_xy_disp = np.vstack([cand_xy_disp, np.array([[x, y]], dtype=float)])
-                new_ci = len(cand_xy_disp) - 1
-                d = float(np.linalg.norm(T_hat[int(ti)] - cand_xy_disp[new_ci]))
-                replaced = False
-                for mi, (tti, _, _) in enumerate(matches_disp):
-                    if int(tti) == int(ti):
-                        matches_disp[mi] = (int(ti), int(new_ci), d)
-                        replaced = True
-                        break
-                if not replaced:
-                    matches_disp.append((int(ti), int(new_ci), d))
+        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
 
         tracked_xy = None
         if update_tracker and args.temporal:
@@ -1614,98 +1892,65 @@ class PreviewApp:
         title = f"{fp.name} | matcher={args.matcher} | inliers={inliers} | err={mean_err:.2f}px"
         if args.temporal:
             title += " | temporal"
-        if self.zoom != 1.0:
-            z = float(self.zoom)
-            gray_disp = cv2.resize(preview_base, (int(preview_base.shape[1] * z), int(preview_base.shape[0] * z)), interpolation=cv2.INTER_LINEAR)
-            if not args.show_overlay:
-                overlay = cv2.cvtColor(gray_disp, cv2.COLOR_GRAY2BGR)
-                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(overlay_rgb)
-                self.photo = ImageTk.PhotoImage(img)
-                self.canvas.delete("all")
-                self.canvas.config(width=img.width, height=img.height, scrollregion=(0, 0, img.width, img.height))
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
-                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name}")
-                self.current_fp = fp
-                self.current_matches = matches_disp
-                self.current_cand_xy = cand_xy_disp
-                self._refresh_detection_list()
-                return
-            cand_xy_s = cand_xy_disp * z
-            T_hat_s = None if T_hat is None else (T_hat * z)
-            matches_draw = matches_disp
-            T_hat_draw = T_hat_s
-            if args.temporal and tracked_xy is not None:
-                if np.isfinite(tracked_xy).any():
-                    T_hat_draw = tracked_xy * z
-                    T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-                matches_draw = []
-            overlay = g.draw_overlay(gray_disp, cand_xy_s, T_hat_draw, matches_draw, title_text=title, gt_xy=None, match_tol=args.match_tol * z)
-            if args.pupil_roi_debug and roi_info is not None:
-                rx0 = float(roi_info.offset_x) * z
-                ry0 = float(roi_info.offset_y) * z
-                rx1 = float(roi_info.offset_x + int(args.pupil_roi_size)) * z
-                ry1 = float(roi_info.offset_y + int(args.pupil_roi_size)) * z
-                cv2.rectangle(
-                    overlay,
-                    (int(round(rx0)), int(round(ry0))),
-                    (int(round(rx1)), int(round(ry1))),
-                    (0, 200, 255),
-                    2,
-                )
+        roi_rect = None
+        if roi_info is not None:
+            roi_rect = (float(roi_info.offset_x), float(roi_info.offset_y), float(int(args.pupil_roi_size)))
+        use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
+        matches_draw = matches_disp
+        if not args.show_overlay:
+            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
         else:
-            if not args.show_overlay:
-                overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(overlay_rgb)
-                self.photo = ImageTk.PhotoImage(img)
-                self.canvas.delete("all")
-                self.canvas.config(width=img.width, height=img.height, scrollregion=(0, 0, img.width, img.height))
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
-                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name}")
-                self.current_fp = fp
-                self.current_matches = matches_disp
-                self.current_cand_xy = cand_xy_disp
-                self._refresh_detection_list()
-                return
-            matches_draw = matches_disp
             T_hat_draw = T_hat
-            if args.temporal and tracked_xy is not None:
+            if use_temporal_display and tracked_xy is not None:
                 if np.isfinite(tracked_xy).any():
                     T_hat_draw = tracked_xy
                     T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
                 matches_draw = []
-            overlay = g.draw_overlay(preview_base, cand_xy_disp, T_hat_draw, matches_draw, title_text=title, gt_xy=None, match_tol=args.match_tol)
-            if args.pupil_roi_debug and roi_info is not None:
-                rx0 = roi_info.offset_x
-                ry0 = roi_info.offset_y
-                rx1 = roi_info.offset_x + int(args.pupil_roi_size)
-                ry1 = roi_info.offset_y + int(args.pupil_roi_size)
-                cv2.rectangle(
-                    overlay,
-                    (int(round(rx0)), int(round(ry0))),
-                    (int(round(rx1)), int(round(ry1))),
-                    (0, 200, 255),
-                    2,
-                )
+            overlay = g.draw_overlay(
+                preview_base,
+                cand_xy_disp,
+                T_hat_draw,
+                matches_draw,
+                title_text=title,
+                gt_xy=None,
+                match_tol=args.match_tol,
+            )
+        if args.pupil_roi_debug and roi_rect is not None:
+            ox, oy, sz = roi_rect
+            cv2.rectangle(
+                overlay,
+                (int(round(ox)), int(round(oy))),
+                (int(round(ox + sz)), int(round(oy + sz))),
+                (0, 200, 255),
+                2,
+            )
 
         overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        cache_key = None
         try:
             cache_key = self._settings_cache_key(args)
-            if cache_key == self.cache_key:
-                with self.cache_lock:
-                    self.frame_cache[fp.name] = {
-                        "overlay_rgb": overlay_rgb,
-                        "matches": matches_disp,
-                        "cand_xy": cand_xy_disp,
-                    }
         except Exception:
-            pass
-        img = Image.fromarray(overlay_rgb)
-        self.photo = ImageTk.PhotoImage(img)
-        self.canvas.delete("all")
-        self.canvas.config(width=img.width, height=img.height, scrollregion=(0, 0, img.width, img.height))
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
+            cache_key = None
+        if cache_key is not None and cache_key == self.cache_key:
+            with self.cache_lock:
+                self.frame_cache[fp.name] = {
+                    "overlay_rgb": overlay_rgb,
+                    "matches": matches_disp if self.corr_mode.get() else matches_draw,
+                    "cand_xy": cand_xy_disp,
+                    "cand_xy_base": cand_xy,
+                    "matches_base": matches,
+                    "T_hat": T_hat,
+                    "tracked_xy": tracked_xy,
+                    "inliers": inliers,
+                    "mean_err": mean_err,
+                    "roi_rect": roi_rect,
+                    "overlay_key": self._overrides_key(fp.name),
+                    "overlay_mode": "corr" if self.corr_mode.get() else "normal",
+                }
+        self.current_preview_base = preview_base
+        self.current_preview_base_name = fp.name
+        self.current_preview_base_cache_key = cache_key
+        self._set_canvas_rgb(overlay_rgb)
 
         self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name}")
         self.current_fp = fp
@@ -1718,30 +1963,26 @@ class PreviewApp:
             return
         if not self.files:
             return
-        args = self._get_args()
-        cache_key = self._settings_cache_key(args)
+        args, cache_key = self._get_args_and_cache_key()
         if args.temporal and self.last_idx is not None and self.idx < self.last_idx:
             self._reset_temporal()
             for i in range(self.idx):
-                self._process_frame(self.files[i], i, update_tracker=True, draw=False)
+                self._process_frame(self.files[i], i, update_tracker=True, draw=False, args_override=args)
         fp = self.files[self.idx]
         if cache_key == self.cache_key:
             with self.cache_lock:
                 entry = self.frame_cache.get(fp.name)
             if entry is not None:
-                overlay_rgb = entry["overlay_rgb"]
-                if self.zoom != 1.0:
-                    z = float(self.zoom)
-                    overlay_rgb = cv2.resize(
-                        overlay_rgb,
-                        (int(overlay_rgb.shape[1] * z), int(overlay_rgb.shape[0] * z)),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                img = Image.fromarray(overlay_rgb)
-                self.photo = ImageTk.PhotoImage(img)
-                self.canvas.delete("all")
-                self.canvas.config(width=img.width, height=img.height, scrollregion=(0, 0, img.width, img.height))
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
+                try:
+                    self._render_overlay_for_entry(fp, entry, args, cache_key)
+                except Exception:
+                    pass
+                overlay_rgb = entry.get("overlay_rgb")
+                if overlay_rgb is None:
+                    self._process_frame(fp, self.idx, update_tracker=True, draw=True)
+                    self.last_idx = self.idx
+                    return
+                self._set_canvas_rgb(overlay_rgb)
                 self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (cached)")
                 self.current_fp = fp
                 self.current_matches = entry.get("matches", [])
@@ -1749,7 +1990,24 @@ class PreviewApp:
                 self._refresh_detection_list()
                 self.last_idx = self.idx
                 return
-        self._process_frame(fp, self.idx, update_tracker=True, draw=True)
+            if self.cache_building:
+                self._start_ondemand_cache_compute(fp, self.idx, args, cache_key)
+                quick_rgb = None
+                try:
+                    if self.current_preview_base_name != fp.name or self.current_preview_base_cache_key != cache_key:
+                        quick_rgb = self._quick_preview_rgb(fp, args, cache_key)
+                except Exception:
+                    quick_rgb = None
+                if quick_rgb is not None:
+                    self._set_canvas_rgb(quick_rgb)
+                    self.current_fp = fp
+                    self.current_matches = []
+                    self.current_cand_xy = np.empty((0, 2), dtype=float)
+                    self._refresh_detection_list()
+                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (caching...)")
+                self._request_render(100)
+                return
+        self._process_frame(fp, self.idx, update_tracker=True, draw=True, args_override=args)
         self.last_idx = self.idx
 
     def next_image(self) -> None:
@@ -1758,7 +2016,7 @@ class PreviewApp:
         if not self.files:
             return
         self.idx = (self.idx + 1) % len(self.files)
-        self.render_current()
+        self._request_render()
 
     def prev_image(self) -> None:
         if self.bulk_processing:
@@ -1766,7 +2024,7 @@ class PreviewApp:
         if not self.files:
             return
         self.idx = (self.idx - 1) % len(self.files)
-        self.render_current()
+        self._request_render()
 
     def toggle_play(self) -> None:
         if self.bulk_processing:
@@ -1788,15 +2046,15 @@ class PreviewApp:
 
     def zoom_in(self) -> None:
         self.zoom = min(8.0, self.zoom * 1.25)
-        self.render_current()
+        self._request_render()
 
     def zoom_out(self) -> None:
         self.zoom = max(0.2, self.zoom / 1.25)
-        self.render_current()
+        self._request_render()
 
     def zoom_reset(self) -> None:
         self.zoom = 1.0
-        self.render_current()
+        self._request_render()
 
     # Correction mode --------------------------------------------------
     def _toggle_correction(self) -> None:
@@ -1805,6 +2063,7 @@ class PreviewApp:
             self._refresh_detection_list()
         else:
             self.corr_frame.pack_forget()
+        self._request_render()
 
     def _refresh_detection_list(self) -> None:
         if not self.corr_mode.get():
@@ -1875,8 +2134,7 @@ class PreviewApp:
                 break
         overrides = self.overrides_by_image.setdefault(self.current_fp.name, {})
         overrides[self.drag_ti] = (float(x), float(y))
-        self._invalidate_cache_for_frame(self.current_fp.name)
-        self.render_current()
+        self._request_render(0)
 
     def on_canvas_drag(self, event) -> None:
         if not self.corr_mode.get() or self.current_fp is None:
@@ -1903,8 +2161,7 @@ class PreviewApp:
             for ti in range(min(4, new_pts.shape[0])):
                 if np.isfinite(new_pts[ti]).all():
                     overrides[int(ti)] = (float(new_pts[ti, 0]), float(new_pts[ti, 1]))
-            self._invalidate_cache_for_frame(self.current_fp.name)
-            self.render_current()
+            self._request_render(16)
             return
         if self.drag_ti is None:
             return
@@ -1912,8 +2169,7 @@ class PreviewApp:
         y = event.y / float(self.zoom)
         overrides = self.overrides_by_image.setdefault(self.current_fp.name, {})
         overrides[self.drag_ti] = (float(x), float(y))
-        self._invalidate_cache_for_frame(self.current_fp.name)
-        self.render_current()
+        self._request_render(16)
 
     def on_canvas_release(self, event) -> None:
         if not self.corr_mode.get():
@@ -1928,8 +2184,7 @@ class PreviewApp:
         if self.current_fp is None:
             return
         self.overrides_by_image.pop(self.current_fp.name, None)
-        self._invalidate_cache_for_frame(self.current_fp.name)
-        self.render_current()
+        self._request_render(0)
 
     def _args_to_config(self, args) -> dict:
         cfg = {k: getattr(args, k) for k in dir(args) if not k.startswith("_")}
@@ -2014,7 +2269,7 @@ class PreviewApp:
                 self.root.after(0, lambda: self.status_var.set(f"Saved full dataset: {Path(out_path).name}"))
             finally:
                 self.bulk_processing = False
-                self.root.after(0, self.render_current)
+                self.root.after(0, self._request_render)
 
         threading.Thread(target=worker, daemon=True).start()
 
