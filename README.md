@@ -81,13 +81,13 @@ python glint_pupil_annotation_review_ui.py --help
 Pre-generated annotations can be found in the Zenodo repository (see above)
 
 
-Evaluation CLI (example):
+Manual template maker:
 
 ```bash
-python glint_pipeline_eval_gen.py <dataset_folder> --help
+python templatemaker_manual.py
 ```
 
-Preview UI -- currently slow. As a shortcut, save the glintz directly and use the annotation review ui. 
+Preview UI with winning sweep config pre-loaded -- currently slow. As a shortcut, save the glintz directly and use the annotation review ui. 
 
 ```bash
 python glint_pipeline_preview_ui.py
@@ -99,10 +99,10 @@ Annotation review/correction UI:
 python glint_pupil_annotation_review_ui.py --help
 ```
 
-Manual template maker:
+Evaluation CLI (example):
 
 ```bash
-python templatemaker_manual.py
+python glint_pipeline_eval_gen.py <dataset_folder> --help
 ```
 
 
