@@ -4,6 +4,8 @@ Reference implementation of a constellation-based corneal reflection ("glint") d
 
 This repository accompanies the NightEyes framework and provides a reproducible implementation of the candidate detection, scoring, and geometric matching pipeline used for identity-preserving glint correspondence.
 
+Pre-generated annotations for the OpenEDS datasets [1,2] can be found in https://zenodo.org/records/18860585. 
+
 ## What's Included
 
 - Modular detection and matching pipeline
@@ -64,7 +66,7 @@ Notes:
 
 ## Running
 
-To run the pipeline on the Chugh et al. dataset, first download their dataset here: https://www.eecg.utoronto.ca/~jayar/datasets/xreyetrack.html
+To run the pipeline on the Chugh et al.[3] dataset, first download their dataset here: https://www.eecg.utoronto.ca/~jayar/datasets/xreyetrack.html
 
 Then run the following (adjust file paths where necessary):
 
@@ -72,11 +74,12 @@ Then run the following (adjust file paths where necessary):
 python glint_pipeline_eval_gen.py "data\LabelledImages\dataset" --labels "data\label.txt" --matcher sla --template_mode bank --template_bank_source default --bank_select_metric strict --template_build_mode procrustes --matching greedy --match_tol 10 --kernel 11 --median_ksize 3 --percentile 99.7 --eps 6 --iters 4000 --min_k 3 --min_inliers 3 --max_pool 30 --min_area 8 --max_area 250 --min_circ 0.45 --min_maxI 200 --auto_scale --ref_width 640 --scale_min 0.6 --scale_max 1.6 --score2_mode contrast_support --contrast_r_inner 3 --contrast_r_outer1 5 --contrast_r_outer2 8 --dog_sigma1 1.0 --dog_sigma2 2.2 --support_M 20 --support_tol 0.08 --support_w 0.1 --cand_fallback --cand_target_raw 8 --cand_fallback_passes 4 --cand_fallback_percentiles "99,98,97" --cand_fallback_kernel_add 0 --cand_merge_eps 2.0 --ratio_tol 0.10 --pivot_P 6 --max_seeds 100 --sla_semantic_prior --sla_semantic_lambda 1.5 --sla_mirror_reject --viz_metrics --save_glints_npz "data\glints.npz"
 ```
 
-Sample OpenEDS annotation
-
+Review and correct annotations by using:
 ```bash
-python glint_pipeline_eval_gen.py "data\openeds19 samples" --matcher sla --template_mode bank --template_bank_source default --bank_select_metric strict --template_build_mode procrustes --matching greedy --match_tol 10 --kernel 11 --median_ksize 3 --percentile 99.7 --eps 6 --iters 4000 --min_k 3 --min_inliers 3 --max_pool 30 --min_area 8 --max_area 250 --min_circ 0.45 --min_maxI 200 --auto_scale --ref_width 640 --scale_min 0.6 --scale_max 1.6 --score2_mode contrast_support --contrast_r_inner 3 --contrast_r_outer1 5 --contrast_r_outer2 8 --dog_sigma1 1.0 --dog_sigma2 2.2 --support_M 20 --support_tol 0.08 --support_w 0.1 --cand_fallback --cand_target_raw 8 --cand_fallback_passes 4 --cand_fallback_percentiles "99,98,97" --cand_fallback_kernel_add 0 --cand_merge_eps 2.0 --ratio_tol 0.10 --pivot_P 6 --max_seeds 100 --sla_semantic_prior --sla_semantic_lambda 1.5 --sla_mirror_reject --viz_metrics --save_glints_npz "data\glints.npz"
+python glint_pupil_annotation_review_ui.py --help
 ```
+Pre-generated annotations can be found in the Zenodo repository (see above)
+
 
 Evaluation CLI (example):
 
@@ -84,7 +87,7 @@ Evaluation CLI (example):
 python glint_pipeline_eval_gen.py <dataset_folder> --help
 ```
 
-Preview UI:
+Preview UI -- currently slow. As a shortcut, save the glintz directly and use the annotation review ui. 
 
 ```bash
 python glint_pipeline_preview_ui.py
@@ -147,3 +150,8 @@ Denmark, Germany, Netherlands, Sweden, under grant agreement No. 101139942.
 
 This repository builds on ideas from constellation matching and star identification algorithms used in spacecraft attitude estimation.
 
+
+## Literature
+[1] Garbin, S. J., Shen, Y., Schuetz, I., Cavin, R., Hughes, G., & Talathi, S. S. (2019). Openeds: Open eye dataset. arXiv preprint arXiv:1905.03702.
+[2] Palmero, C., Sharma, A., Behrendt, K., Krishnakumar, K., Komogortsev, O. V., & Talathi, S. S. (2020). Openeds2020: Open eyes dataset. arXiv preprint arXiv:2005.03876.
+[3] Chugh, S., Brousseau, B., Rose, J., & Eizenman, M. (2021, January). Detection and correspondence matching of corneal reflections for eye tracking using deep learning. In 2020 25th international conference on pattern recognition (ICPR) (pp. 2210-2217). IEEE.
