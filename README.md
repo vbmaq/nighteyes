@@ -13,11 +13,6 @@ Pre-generated annotations for the OpenEDS datasets [1,2] can be found in https:/
 - Evaluation scripts for benchmarking correspondence accuracy
 - Utilities for dataset processing and visualization
 
-## To-Do's 
-- optimize glint UI
-- add stereo capabilities
-- improve Correction mode
-
 ## Overview
 
 Video-based eye trackers using the pupil-corneal reflection (P-CR) method estimate gaze by detecting the pupil and reflections of infrared LEDs on the cornea. Accurate gaze estimation requires reliable localization and identity-preserving correspondence between detected glints and the physical LEDs.
@@ -134,6 +129,13 @@ reports/    # Matching accuracy and localization statistics
 csv/        # Evaluation metrics for downstream analysis
 ```
 
+
+## To-Do's 
+- optimize glint UI
+- add stereo capabilities
+- improve Correction mode
+  
+
 ## Reproducibility
 
 This repository includes the components used for reproducible evaluation and benchmarking of glint matching algorithms, including pipeline stages, template tools, and evaluation scripts. Hyperparameter sweeps and configuration selection are tracked in the repository (see `sweeps/`).
@@ -160,3 +162,5 @@ This repository builds on ideas from constellation matching and star identificat
 * [1] Garbin, S. J., Shen, Y., Schuetz, I., Cavin, R., Hughes, G., & Talathi, S. S. (2019). Openeds: Open eye dataset. arXiv preprint arXiv:1905.03702.
 * [2] Palmero, C., Sharma, A., Behrendt, K., Krishnakumar, K., Komogortsev, O. V., & Talathi, S. S. (2020). Openeds2020: Open eyes dataset. arXiv preprint arXiv:2005.03876.
 * [3] Chugh, S., Brousseau, B., Rose, J., & Eizenman, M. (2021, January). Detection and correspondence matching of corneal reflections for eye tracking using deep learning. In 2020 25th international conference on pattern recognition (ICPR) (pp. 2210-2217). IEEE.
+
+  
