@@ -13,6 +13,11 @@ Pre-generated annotations for the OpenEDS datasets [1,2] can be found in https:/
 - Evaluation scripts for benchmarking correspondence accuracy
 - Utilities for dataset processing and visualization
 
+## To-Do's 
+- optimize glint UI
+- add stereo capabilities
+- improve Correction mode
+
 ## Overview
 
 Video-based eye trackers using the pupil-corneal reflection (P-CR) method estimate gaze by detecting the pupil and reflections of infrared LEDs on the cornea. Accurate gaze estimation requires reliable localization and identity-preserving correspondence between detected glints and the physical LEDs.
