@@ -135,7 +135,7 @@ csv/        # Evaluation metrics for downstream analysis
 - optimize glint UI
 - add stereo capabilities
 - improve Correction mode
-  
+- improve built-in pupil detection methods
 
 ## Reproducibility
 
