@@ -213,6 +213,74 @@ def _overlay_key_payload(args, overrides_key, corr_mode: bool) -> dict:
 _MP_SAVE_STATE = {}
 
 
+class _Tooltip:
+    def __init__(self, root: tk.Tk, delay_ms: int = 500, wraplength: int = 440) -> None:
+        self.root = root
+        self.delay_ms = int(delay_ms)
+        self.wraplength = int(wraplength)
+        self._after_id = None
+        self._tipwin = None
+        self._text = ""
+        self._x = 0
+        self._y = 0
+
+    def bind(self, widget, text: str) -> None:
+        if not text:
+            return
+        widget.bind("<Enter>", lambda e, w=widget, t=text: self._schedule(w, t, e), add="+")
+        widget.bind("<Leave>", lambda _e: self.hide(), add="+")
+        widget.bind("<ButtonPress>", lambda _e: self.hide(), add="+")
+
+    def _schedule(self, _widget, text: str, event) -> None:
+        self._text = text
+        self._x = int(getattr(event, "x_root", 0)) + 16
+        self._y = int(getattr(event, "y_root", 0)) + 12
+        self._cancel()
+        self._after_id = self.root.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+
+    def hide(self) -> None:
+        self._cancel()
+        if self._tipwin is None:
+            return
+        try:
+            self._tipwin.destroy()
+        except Exception:
+            pass
+        self._tipwin = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._tipwin is not None or not self._text:
+            return
+        try:
+            tw = tk.Toplevel(self.root)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{self._x}+{self._y}")
+            label = tk.Label(
+                tw,
+                text=self._text,
+                justify=tk.LEFT,
+                background="#ffffe0",
+                relief=tk.SOLID,
+                borderwidth=1,
+                wraplength=self.wraplength,
+                font=("Segoe UI", 9),
+            )
+            label.pack(ipadx=6, ipady=4)
+            self._tipwin = tw
+        except Exception:
+            self._tipwin = None
+
+
 def _mp_save_init(
     args_dict,
     template,
@@ -626,27 +694,253 @@ class PreviewApp:
 
         ctrl_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
+        tooltip = _Tooltip(self.root)
+        field_help = {
+            "preview_enhanced": "If enabled, the background preview image uses the enhanced version of the frame.\nThis affects only how the preview looks (not the candidate/match computation).",
+            "show_overlay": "Draw the detected candidates and matched glints on the image.\nDisable to show the plain grayscale preview (faster).",
+            "matcher": "Matching algorithm.\n- ransac: RANSAC-based constellation fit\n- star: star-tracker style voting\n- hybrid: combines ransac + star\n- sla: structured layout-aware matcher",
+            "template_mode": "Template source.\n- single: use one template\n- bank: choose best template from a bank",
+            "matching": "Final assignment step for matching template points to candidates.\n- greedy: fast heuristic assignment\n- hungarian: optimal assignment (slower)",
+            "match_tol": "Pixel tolerance used for visualization (and GT metrics in eval script) when judging a match as correct.",
+            "min_inliers": "Minimum number of matched points required to accept a hypothesis.",
+            "appearance_tiebreak": "When enabled, uses candidate score2 as an additional tiebreaker between hypotheses.",
+            "eps": "Inlier threshold (pixels) used by matchers to consider a candidate consistent with the hypothesis.",
+            "max_pool": "Maximum number of candidates (highest score2) passed into matching.",
+            "layout_prior": "Enable a soft prior that prefers physically plausible glint layouts.",
+            "layout_lambda": "Strength of the layout prior penalty (higher = stronger).",
+            "seed": "Random seed used by matchers that sample hypotheses (e.g., RANSAC).",
+            "scale_min": "Minimum allowed scale for similarity transform hypotheses.",
+            "scale_max": "Maximum allowed scale for similarity transform hypotheses.",
+            "disable_scale_gate": "Disable the scale_min/scale_max gating (allows any scale).",
+            "min_k": "Number of points used per RANSAC hypothesis (typically 3).",
+            "iters": "Number of RANSAC iterations (more = slower but can be more robust).",
+            "vote_M": "Star matcher: shortlist size per template point (higher = more hypotheses).",
+            "vote_ratio_tol": "Star matcher: tolerance on log-scale ratio (gating of hypothesized scales).",
+            "vote_max_hyp": "Star matcher: maximum number of hypotheses to verify.",
+            "vote_w_score2": "Star matcher: weight of score2 in vote ranking (0 = geometry-only).",
+            "thr_pct": "Percentile threshold for candidate mask (higher = fewer candidates).",
+            "kernel": "Top-hat kernel size (odd). Larger finds broader bright spots but can merge structures.",
+            "min_area": "Minimum connected-component area (pixels) to keep a candidate blob.",
+            "max_area": "Maximum connected-component area (pixels) to keep a candidate blob.",
+            "min_circ": "Minimum circularity (0..1) for candidate blobs (higher = more circular).",
+            "cand_fallback": "If enabled, runs additional candidate passes if too few raw candidates are found.",
+            "cand_target_raw": "Target raw candidate count before fallback stops (used with cand_fallback).",
+            "cand_fallback_passes": "Maximum number of fallback passes (used with cand_fallback).",
+            "cand_fallback_percentiles": "Comma-separated percentiles to try for fallback passes (e.g. 99.5,99,98.5,98).",
+            "score2_mode": "How candidates are scored/ranked before matching.\n- heuristic: simple score\n- contrast: contrast-based\n- contrast_support: contrast + neighborhood support\n- ml_cc: ML model over candidate connected components",
+            "ml_model_path": "Path to the ML model file.\nOnly used when score2_mode = ml_cc.",
+            "support_M": "Support scoring: number of neighbors to consider.\nOnly used when score2_mode = contrast_support.",
+            "support_tol": "Support scoring: tolerance parameter.\nOnly used when score2_mode = contrast_support.",
+            "support_w": "Support scoring: weight of support term.\nOnly used when score2_mode = contrast_support.",
+            "contrast_r_inner": "Contrast scoring: inner radius (pixels).\nUsed when score2_mode is contrast/contrast_support.",
+            "contrast_r_outer1": "Contrast scoring: outer radius 1 (pixels).\nUsed when score2_mode is contrast/contrast_support.",
+            "contrast_r_outer2": "Contrast scoring: outer radius 2 (pixels).\nUsed when score2_mode is contrast/contrast_support.",
+            "enhance_mode": "Enhancement mode applied before candidate detection (when enhance_enable is on).",
+            "enhance_enable": "Enable/disable enhancement pipeline (tophat/dog/highpass).",
+            "median_ksize": "Median blur kernel size (odd).",
+            "denoise": "Enable denoising as part of enhancement (median blur).",
+            "denoise_k": "Override median blur kernel size (0 uses median_ksize). Only used when denoise is enabled.",
+            "clahe": "Enable CLAHE (contrast-limited adaptive histogram equalization).",
+            "clahe_clip": "CLAHE clip limit. Only used when CLAHE is enabled.",
+            "clahe_tiles": "CLAHE tile grid size. Only used when CLAHE is enabled.",
+            "gamma_enable": "Enable gamma correction.",
+            "gamma": "Gamma correction (>1 darkens, <1 brightens). Only used when gamma_enable is enabled.",
+            "unsharp": "Enable unsharp mask sharpening.",
+            "unsharp_amount": "Unsharp strength. Only used when unsharp is enabled.",
+            "unsharp_sigma": "Unsharp blur sigma. Only used when unsharp is enabled.",
+            "minmax": "Enable min-max normalization during enhancement.",
+            "clean_k": "Morphology cleanup kernel size for candidate mask.",
+            "open_iter": "Morphology open iterations for cleanup.",
+            "close_iter": "Morphology close iterations for cleanup.",
+            "dog_sigma1": "DoG enhancement: sigma1. Only used when enhance_mode = dog.",
+            "dog_sigma2": "DoG enhancement: sigma2. Only used when enhance_mode = dog.",
+            "pupil_roi": "Enable pupil-centered ROI cropping for candidate detection (reduces search area).",
+            "pupil_roi_size": "ROI size (pixels). Only used when pupil_roi is enabled.",
+            "pupil_roi_pad_mode": "Padding mode if ROI goes out of bounds. Only used when pupil_roi is enabled.",
+            "pupil_roi_pad_value": "Constant padding value (0..255). Only used when pupil_roi_pad_mode = constant.",
+            "pupil_roi_fail_policy": "What to do if pupil center is unavailable.\n- skip: skip frame\n- full_frame: fall back to full image\n- last_good: reuse last good pupil center",
+            "pupil_roi_debug": "Draw the ROI rectangle on the preview (debug).",
+            "pupil_source": "Where pupil center comes from (auto/labels/naive/swirski/npz/none).",
+            "pupil_axis_mode": "Pupil axis mode for interpreting pupil size inputs (auto/radius/diameter).",
+            "pivot_P": "SLA matcher: consider top-P pivot candidates by score2.",
+            "ratio_tol": "SLA matcher: log-ratio tolerance for geometric consistency.",
+            "max_seeds": "SLA matcher: maximum seed hypotheses to try.",
+            "grow_resid_max": "SLA matcher: max median residual when growing. Leave blank to use eps.",
+            "sla_layout_prior": "SLA-only: enable layout prior inside SLA.",
+            "sla_layout_lambda": "SLA-only: strength of SLA layout prior penalty.",
+            "sla_semantic_prior": "SLA-only: enable semantic geometry prior.",
+            "sla_semantic_mode": "SLA-only: which semantic rules apply (full vs top_only).",
+            "sla_semantic_lambda": "SLA-only: semantic penalty weight.",
+            "temporal": "Enable temporal tracking/smoothing across frames.",
+            "temporal_gate_px": "Temporal tracking: gating radius in pixels.",
+            "temporal_max_missed": "Temporal tracking: max consecutive missed frames before a track is dropped.",
+            "temporal_lambda": "Temporal tracking: smoothing strength (higher = smoother but less responsive).",
+            "temporal_w_scale": "Temporal tracking: weight on scale changes.",
+            "temporal_w_rot": "Temporal tracking: weight on rotation changes.",
+            "temporal_w_trans": "Temporal tracking: weight on translation changes.",
+        }
+
         self.vars = {}
+        self.field_rows = {}
+        self.field_pack_opts = {}
+        self.field_parent = {}
+        self.field_order_by_parent = {}
+        self.group_frames = {}
+        self.group_pack_opts = {}
+        self.group_order = []
+
+        def _register_group(key: str, frame, pack_opts: dict) -> None:
+            self.group_frames[key] = frame
+            self.group_pack_opts[key] = pack_opts
+            self.group_order.append(key)
+
+        def _set_group_visible(key: str, visible: bool) -> None:
+            frame = self.group_frames.get(key)
+            if frame is None:
+                return
+            is_packed = frame.winfo_manager() == "pack"
+            if visible:
+                if is_packed:
+                    return
+                before_widget = None
+                try:
+                    idx = self.group_order.index(key)
+                except ValueError:
+                    idx = -1
+                if idx >= 0:
+                    for next_key in self.group_order[idx + 1 :]:
+                        next_frame = self.group_frames.get(next_key)
+                        if next_frame is not None and next_frame.winfo_manager() == "pack":
+                            before_widget = next_frame
+                            break
+                if before_widget is not None:
+                    frame.pack(before=before_widget, **self.group_pack_opts.get(key, {"fill": tk.X}))
+                else:
+                    frame.pack(**self.group_pack_opts.get(key, {"fill": tk.X}))
+            else:
+                if not is_packed:
+                    return
+                frame.pack_forget()
+
+        def _register_field_row(key: str, row: ttk.Frame, parent):
+            self.field_rows[key] = row
+            self.field_parent[key] = parent
+            self.field_pack_opts[key] = {"fill": tk.X, "pady": 2}
+            self.field_order_by_parent.setdefault(parent, []).append(key)
+
+        def _set_field_visible(key: str, visible: bool) -> None:
+            row = self.field_rows.get(key)
+            if row is None:
+                return
+            is_packed = row.winfo_manager() == "pack"
+            if visible:
+                if is_packed:
+                    return
+                parent = self.field_parent.get(key)
+                order = self.field_order_by_parent.get(parent, [])
+                before_widget = None
+                try:
+                    idx = order.index(key)
+                except ValueError:
+                    idx = -1
+                if idx >= 0:
+                    for next_key in order[idx + 1 :]:
+                        next_row = self.field_rows.get(next_key)
+                        if next_row is not None and next_row.winfo_manager() == "pack":
+                            before_widget = next_row
+                            break
+                if before_widget is not None:
+                    row.pack(before=before_widget, **self.field_pack_opts.get(key, {"fill": tk.X, "pady": 2}))
+                else:
+                    row.pack(**self.field_pack_opts.get(key, {"fill": tk.X, "pady": 2}))
+            else:
+                if not is_packed:
+                    return
+                row.pack_forget()
+
+        def _update_dependent_visibility(_evt=None) -> None:
+            score2_mode = self.vars.get("score2_mode").get() if "score2_mode" in self.vars else ""
+            enhance_mode = self.vars.get("enhance_mode").get() if "enhance_mode" in self.vars else ""
+            denoise = bool(self.vars.get("denoise").get()) if "denoise" in self.vars else False
+            clahe = bool(self.vars.get("clahe").get()) if "clahe" in self.vars else False
+            gamma_enable = bool(self.vars.get("gamma_enable").get()) if "gamma_enable" in self.vars else False
+            unsharp = bool(self.vars.get("unsharp").get()) if "unsharp" in self.vars else False
+            cand_fallback = bool(self.vars.get("cand_fallback").get()) if "cand_fallback" in self.vars else False
+            pupil_roi = bool(self.vars.get("pupil_roi").get()) if "pupil_roi" in self.vars else False
+            pad_mode = self.vars.get("pupil_roi_pad_mode").get() if "pupil_roi_pad_mode" in self.vars else ""
+            matcher = self.vars.get("matcher").get() if "matcher" in self.vars else ""
+            temporal = bool(self.vars.get("temporal").get()) if "temporal" in self.vars else False
+
+            _set_field_visible("ml_model_path", score2_mode == "ml_cc")
+            for k in ("contrast_r_inner", "contrast_r_outer1", "contrast_r_outer2"):
+                _set_field_visible(k, score2_mode in ("contrast", "contrast_support"))
+            for k in ("support_M", "support_tol", "support_w"):
+                _set_field_visible(k, score2_mode == "contrast_support")
+
+            _set_field_visible("denoise_k", denoise)
+            for k in ("clahe_clip", "clahe_tiles"):
+                _set_field_visible(k, clahe)
+            _set_field_visible("gamma", gamma_enable)
+            for k in ("unsharp_amount", "unsharp_sigma"):
+                _set_field_visible(k, unsharp)
+            for k in ("dog_sigma1", "dog_sigma2"):
+                _set_field_visible(k, enhance_mode == "dog")
+
+            for k in ("cand_target_raw", "cand_fallback_passes", "cand_fallback_percentiles"):
+                _set_field_visible(k, cand_fallback)
+
+            for k in (
+                "pupil_roi_size",
+                "pupil_roi_pad_mode",
+                "pupil_roi_pad_value",
+                "pupil_roi_fail_policy",
+                "pupil_roi_debug",
+                "pupil_source",
+                "pupil_axis_mode",
+            ):
+                _set_field_visible(k, pupil_roi)
+            _set_field_visible("pupil_roi_pad_value", pupil_roi and pad_mode == "constant")
+
+            _set_field_visible("min_inliers", matcher in ("star", "sla", "hybrid"))
+            _set_group_visible("scale", matcher in ("ransac", "star", "hybrid"))
+            _set_group_visible("ransac", matcher in ("ransac", "hybrid"))
+            _set_group_visible("star", matcher in ("star", "hybrid"))
+
+            for k in ("sla_layout_prior", "sla_layout_lambda", "sla_semantic_prior", "sla_semantic_mode", "sla_semantic_lambda"):
+                _set_field_visible(k, matcher == "sla")
+            _set_group_visible("sla", matcher == "sla")
+
+            for k in ("temporal_gate_px", "temporal_max_missed", "temporal_lambda", "temporal_w_scale", "temporal_w_rot", "temporal_w_trans"):
+                _set_field_visible(k, temporal)
+
         def add_field(label, key, default, field_type="entry", values=None, parent=None):
             parent = ctrl if parent is None else parent
             row = ttk.Frame(parent)
             row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=label, width=20).pack(side=tk.LEFT)
+            _register_field_row(key, row, parent)
+            lbl = ttk.Label(row, text=label, width=20)
+            lbl.pack(side=tk.LEFT)
+            tip = field_help.get(key, "")
+            tooltip.bind(lbl, tip)
+            tooltip.bind(row, tip)
             if field_type == "combobox":
                 var = tk.StringVar(value=str(default))
                 cb = ttk.Combobox(row, textvariable=var, values=values, width=14, state="readonly")
                 cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 self.vars[key] = var
+                tooltip.bind(cb, tip)
             elif field_type == "check":
                 var = tk.BooleanVar(value=bool(default))
                 chk = ttk.Checkbutton(row, variable=var)
                 chk.pack(side=tk.LEFT)
                 self.vars[key] = var
+                tooltip.bind(chk, tip)
             else:
                 var = tk.StringVar(value=str(default))
                 ent = ttk.Entry(row, textvariable=var, width=16)
                 ent.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 self.vars[key] = var
+                tooltip.bind(ent, tip)
 
         # Template/image config load
         cfg_row = ttk.Frame(ctrl)
@@ -668,46 +962,13 @@ class PreviewApp:
 
         grp_display = ttk.LabelFrame(ctrl, text="Display", padding=6)
         grp_display.pack(fill=tk.X, pady=(0, 8))
+        _register_group("display", grp_display, {"fill": tk.X, "pady": (0, 8)})
         add_field("preview_enhanced", "preview_enhanced", False, "check", parent=grp_display)
         add_field("show_overlay", "show_overlay", True, "check", parent=grp_display)
 
-        grp_matching = ttk.LabelFrame(ctrl, text="Matching", padding=6)
-        grp_matching.pack(fill=tk.X, pady=(0, 8))
-        add_field("matcher", "matcher", "hybrid", "combobox", ["ransac", "star", "hybrid", "sla"], parent=grp_matching)
-        add_field("template_mode", "template_mode", "bank", "combobox", ["single", "bank"], parent=grp_matching)
-        add_field("eps", "eps", 6.0, parent=grp_matching)
-        add_field("max_pool", "max_pool", 30, parent=grp_matching)
-        add_field("ratio_tol", "ratio_tol", 0.12, parent=grp_matching)
-        add_field("pivot_P", "pivot_P", 8, parent=grp_matching)
-        add_field("max_seeds", "max_seeds", 200, parent=grp_matching)
-        add_field("layout_prior", "layout_prior", False, "check", parent=grp_matching)
-        add_field("layout_lambda", "layout_lambda", 0.25, parent=grp_matching)
-
-        grp_candidates = ttk.LabelFrame(ctrl, text="Candidates / Thresholding", padding=6)
-        grp_candidates.pack(fill=tk.X, pady=(0, 8))
-        add_field("thr_pct", "percentile", 99.7, parent=grp_candidates)
-        add_field("kernel", "kernel", 11, parent=grp_candidates)
-        add_field("min_area", "min_area", 8, parent=grp_candidates)
-        add_field("max_area", "max_area", 250, parent=grp_candidates)
-        add_field("min_circ", "min_circ", 0.45, parent=grp_candidates)
-        add_field("cand_fallback", "cand_fallback", True, "check", parent=grp_candidates)
-        add_field("cand_target_raw", "cand_target_raw", 12, parent=grp_candidates)
-        add_field("cand_fallback_passes", "cand_fallback_passes", 4, parent=grp_candidates)
-        add_field("cand_fallback_percentiles", "cand_fallback_percentiles", "99.5,99,98.5,98", parent=grp_candidates)
-
-        grp_scoring = ttk.LabelFrame(ctrl, text="Scoring (contrast / support / ML)", padding=6)
-        grp_scoring.pack(fill=tk.X, pady=(0, 8))
-        add_field("score2_mode", "score2_mode", "contrast_support", "combobox", ["heuristic", "contrast", "contrast_support", "ml_cc"], parent=grp_scoring)
-        add_field("ml_model_path", "ml_model_path", "", parent=grp_scoring)
-        add_field("support_M", "support_M", 30, parent=grp_scoring)
-        add_field("support_tol", "support_tol", 0.10, parent=grp_scoring)
-        add_field("support_w", "support_w", 0.15, parent=grp_scoring)
-        add_field("contrast_r_inner", "contrast_r_inner", 3, parent=grp_scoring)
-        add_field("contrast_r_outer1", "contrast_r_outer1", 5, parent=grp_scoring)
-        add_field("contrast_r_outer2", "contrast_r_outer2", 8, parent=grp_scoring)
-
         grp_enhance = ttk.LabelFrame(ctrl, text="Enhancement / Cleanup", padding=6)
         grp_enhance.pack(fill=tk.X, pady=(0, 8))
+        _register_group("enhance", grp_enhance, {"fill": tk.X, "pady": (0, 8)})
         add_field("enhance_mode", "enhance_mode", "tophat", "combobox", ["tophat", "dog", "highpass"], parent=grp_enhance)
         add_field("enhance_enable", "enhance_enable", True, "check", parent=grp_enhance)
         add_field("median_ksize", "median_ksize", 3, parent=grp_enhance)
@@ -728,27 +989,109 @@ class PreviewApp:
         add_field("dog_sigma1", "dog_sigma1", 1.0, parent=grp_enhance)
         add_field("dog_sigma2", "dog_sigma2", 2.2, parent=grp_enhance)
 
-        grp_pupil = ttk.LabelFrame(ctrl, text="Pupil ROI", padding=6)
-        grp_pupil.pack(fill=tk.X, pady=(0, 8))
-        add_field("pupil_roi", "pupil_roi", False, "check", parent=grp_pupil)
-        add_field("pupil_roi_size", "pupil_roi_size", 80, parent=grp_pupil)
-        add_field("pupil_roi_pad_mode", "pupil_roi_pad_mode", "reflect", "combobox", ["reflect", "constant", "edge"], parent=grp_pupil)
-        add_field("pupil_roi_pad_value", "pupil_roi_pad_value", 0, parent=grp_pupil)
-        add_field("pupil_roi_fail_policy", "pupil_roi_fail_policy", "skip", "combobox", ["skip", "full_frame", "last_good"], parent=grp_pupil)
-        add_field("pupil_roi_debug", "pupil_roi_debug", False, "check", parent=grp_pupil)
-        add_field("pupil_source", "pupil_source", "none", "combobox", ["auto", "labels", "naive", "swirski", "npz", "none"], parent=grp_pupil)
-        add_field("pupil_axis_mode", "pupil_axis_mode", "auto", "combobox", ["auto", "radius", "diameter"], parent=grp_pupil)
+        grp_scoring = ttk.LabelFrame(ctrl, text="Scoring (contrast / support / ML)", padding=6)
+        grp_scoring.pack(fill=tk.X, pady=(0, 8))
+        _register_group("scoring", grp_scoring, {"fill": tk.X, "pady": (0, 8)})
+        add_field(
+            "score2_mode",
+            "score2_mode",
+            "contrast_support",
+            "combobox",
+            ["heuristic", "contrast", "contrast_support", "ml_cc"],
+            parent=grp_scoring,
+        )
+        add_field("ml_model_path", "ml_model_path", "", parent=grp_scoring)
+        add_field("support_M", "support_M", 30, parent=grp_scoring)
+        add_field("support_tol", "support_tol", 0.10, parent=grp_scoring)
+        add_field("support_w", "support_w", 0.15, parent=grp_scoring)
+        add_field("contrast_r_inner", "contrast_r_inner", 3, parent=grp_scoring)
+        add_field("contrast_r_outer1", "contrast_r_outer1", 5, parent=grp_scoring)
+        add_field("contrast_r_outer2", "contrast_r_outer2", 8, parent=grp_scoring)
+
+        grp_candidates = ttk.LabelFrame(ctrl, text="Candidates / Thresholding", padding=6)
+        grp_candidates.pack(fill=tk.X, pady=(0, 8))
+        _register_group("candidates", grp_candidates, {"fill": tk.X, "pady": (0, 8)})
+        add_field("thr_pct", "percentile", 99.7, parent=grp_candidates)
+        add_field("kernel", "kernel", 11, parent=grp_candidates)
+        add_field("min_area", "min_area", 8, parent=grp_candidates)
+        add_field("max_area", "max_area", 250, parent=grp_candidates)
+        add_field("min_circ", "min_circ", 0.45, parent=grp_candidates)
+        add_field("cand_fallback", "cand_fallback", True, "check", parent=grp_candidates)
+        add_field("cand_target_raw", "cand_target_raw", 12, parent=grp_candidates)
+        add_field("cand_fallback_passes", "cand_fallback_passes", 4, parent=grp_candidates)
+        add_field("cand_fallback_percentiles", "cand_fallback_percentiles", "99.5,99,98.5,98", parent=grp_candidates)
+
+        grp_matching = ttk.LabelFrame(ctrl, text="Matching", padding=6)
+        grp_matching.pack(fill=tk.X, pady=(0, 8))
+        _register_group("matching", grp_matching, {"fill": tk.X, "pady": (0, 8)})
+        add_field("matcher", "matcher", "hybrid", "combobox", ["ransac", "star", "hybrid", "sla"], parent=grp_matching)
+        add_field("template_mode", "template_mode", "bank", "combobox", ["single", "bank"], parent=grp_matching)
+        add_field("matching", "matching", "greedy", "combobox", ["greedy", "hungarian"], parent=grp_matching)
+        add_field("match_tol", "match_tol", 10.0, parent=grp_matching)
+        add_field("min_inliers", "min_inliers", 3, parent=grp_matching)
+        add_field("appearance_tiebreak", "appearance_tiebreak", False, "check", parent=grp_matching)
+        add_field("eps", "eps", 6.0, parent=grp_matching)
+        add_field("max_pool", "max_pool", 30, parent=grp_matching)
+        add_field("layout_prior", "layout_prior", False, "check", parent=grp_matching)
+        add_field("layout_lambda", "layout_lambda", 0.25, parent=grp_matching)
+
+        grp_scale = ttk.LabelFrame(ctrl, text="Scale / Gating", padding=6)
+        grp_scale.pack(fill=tk.X, pady=(0, 8))
+        _register_group("scale", grp_scale, {"fill": tk.X, "pady": (0, 8)})
+        add_field("seed", "seed", 0, parent=grp_scale)
+        add_field("scale_min", "scale_min", 0.6, parent=grp_scale)
+        add_field("scale_max", "scale_max", 1.6, parent=grp_scale)
+        add_field("disable_scale_gate", "disable_scale_gate", False, "check", parent=grp_scale)
+
+        grp_ransac = ttk.LabelFrame(ctrl, text="RANSAC", padding=6)
+        grp_ransac.pack(fill=tk.X, pady=(0, 8))
+        _register_group("ransac", grp_ransac, {"fill": tk.X, "pady": (0, 8)})
+        add_field("min_k", "min_k", 3, parent=grp_ransac)
+        add_field("iters", "iters", 4000, parent=grp_ransac)
+
+        grp_star = ttk.LabelFrame(ctrl, text="Star", padding=6)
+        grp_star.pack(fill=tk.X, pady=(0, 8))
+        _register_group("star", grp_star, {"fill": tk.X, "pady": (0, 8)})
+        add_field("vote_M", "vote_M", 8, parent=grp_star)
+        add_field("vote_ratio_tol", "vote_ratio_tol", 0.12, parent=grp_star)
+        add_field("vote_max_hyp", "vote_max_hyp", 2000, parent=grp_star)
+        add_field("vote_w_score2", "vote_w_score2", 0.0, parent=grp_star)
 
         grp_sla = ttk.LabelFrame(ctrl, text="SLA", padding=6)
         grp_sla.pack(fill=tk.X, pady=(0, 8))
+        _register_group("sla", grp_sla, {"fill": tk.X, "pady": (0, 8)})
+        add_field("pivot_P", "pivot_P", 8, parent=grp_sla)
+        add_field("ratio_tol", "ratio_tol", 0.12, parent=grp_sla)
+        add_field("max_seeds", "max_seeds", 200, parent=grp_sla)
+        add_field("grow_resid_max", "grow_resid_max", "", parent=grp_sla)
         add_field("sla_layout_prior", "sla_layout_prior", False, "check", parent=grp_sla)
         add_field("sla_layout_lambda", "sla_layout_lambda", 0.25, parent=grp_sla)
         add_field("sla_semantic_prior", "sla_semantic_prior", False, "check", parent=grp_sla)
         add_field("sla_semantic_mode", "sla_semantic_mode", "full", "combobox", ["full", "top_only"], parent=grp_sla)
         add_field("sla_semantic_lambda", "sla_semantic_lambda", 1.5, parent=grp_sla)
 
+        grp_pupil = ttk.LabelFrame(ctrl, text="Pupil ROI", padding=6)
+        grp_pupil.pack(fill=tk.X, pady=(0, 8))
+        _register_group("pupil", grp_pupil, {"fill": tk.X, "pady": (0, 8)})
+        add_field("pupil_roi", "pupil_roi", False, "check", parent=grp_pupil)
+        add_field("pupil_roi_size", "pupil_roi_size", 80, parent=grp_pupil)
+        add_field("pupil_roi_pad_mode", "pupil_roi_pad_mode", "reflect", "combobox", ["reflect", "constant", "edge"], parent=grp_pupil)
+        add_field("pupil_roi_pad_value", "pupil_roi_pad_value", 0, parent=grp_pupil)
+        add_field("pupil_roi_fail_policy", "pupil_roi_fail_policy", "skip", "combobox", ["skip", "full_frame", "last_good"], parent=grp_pupil)
+        add_field("pupil_roi_debug", "pupil_roi_debug", False, "check", parent=grp_pupil)
+        add_field(
+            "pupil_source",
+            "pupil_source",
+            "none",
+            "combobox",
+            ["auto", "labels", "naive", "swirski", "npz", "none"],
+            parent=grp_pupil,
+        )
+        add_field("pupil_axis_mode", "pupil_axis_mode", "auto", "combobox", ["auto", "radius", "diameter"], parent=grp_pupil)
+
         grp_temporal = ttk.LabelFrame(ctrl, text="Temporal", padding=6)
         grp_temporal.pack(fill=tk.X, pady=(0, 8))
+        _register_group("temporal", grp_temporal, {"fill": tk.X, "pady": (0, 8)})
         add_field("temporal", "temporal", False, "check", parent=grp_temporal)
         add_field("temporal_gate_px", "temporal_gate_px", 25.0, parent=grp_temporal)
         add_field("temporal_max_missed", "temporal_max_missed", 5, parent=grp_temporal)
@@ -798,6 +1141,28 @@ class PreviewApp:
             self.mirror_var.trace_add("write", self._on_settings_change)
         except Exception:
             pass
+        # dependent field visibility
+        for k in (
+            "score2_mode",
+            "enhance_mode",
+            "denoise",
+            "clahe",
+            "gamma_enable",
+            "unsharp",
+            "cand_fallback",
+            "pupil_roi",
+            "pupil_roi_pad_mode",
+            "matcher",
+            "temporal",
+        ):
+            var = self.vars.get(k)
+            if var is None:
+                continue
+            try:
+                var.trace_add("write", lambda *_a: self.root.after_idle(_update_dependent_visibility))
+            except Exception:
+                pass
+        self.root.after_idle(_update_dependent_visibility)
 
     def _request_render(self, delay_ms: int = 0) -> None:
         if self.render_request_id is not None:
@@ -1165,7 +1530,14 @@ class PreviewApp:
         args.ratio_tol = getv("ratio_tol", float)
         args.pivot_P = getv("pivot_P", int)
         args.max_seeds = getv("max_seeds", int)
-        args.grow_resid_max = None
+        grow_s = self.vars.get("grow_resid_max").get().strip() if "grow_resid_max" in self.vars else ""
+        if not grow_s:
+            args.grow_resid_max = None
+        else:
+            try:
+                args.grow_resid_max = float(grow_s)
+            except Exception:
+                args.grow_resid_max = None
         args.layout_prior = getb("layout_prior")
         args.layout_lambda = getv("layout_lambda", float)
         args.layout_mode = "image"
@@ -1202,18 +1574,18 @@ class PreviewApp:
         args.temporal_w_trans = getv("temporal_w_trans", float)
         args.temporal_use_tracks_for_matching = True
         args.temporal_roi_radius = 0.0
-        args.vote_M = 8
-        args.vote_ratio_tol = 0.12
-        args.vote_max_hyp = 2000
-        args.vote_w_score2 = 0.0
-        args.min_k = 3
-        args.iters = 4000
-        args.seed = 0
-        args.scale_min = 0.6
-        args.scale_max = 1.6
-        args.disable_scale_gate = False
-        args.matching = "greedy"
-        args.appearance_tiebreak = False
+        args.vote_M = getv("vote_M", int)
+        args.vote_ratio_tol = getv("vote_ratio_tol", float)
+        args.vote_max_hyp = getv("vote_max_hyp", int)
+        args.vote_w_score2 = getv("vote_w_score2", float)
+        args.min_k = getv("min_k", int)
+        args.iters = getv("iters", int)
+        args.seed = getv("seed", int)
+        args.scale_min = getv("scale_min", float)
+        args.scale_max = getv("scale_max", float)
+        args.disable_scale_gate = getb("disable_scale_gate")
+        args.matching = self.vars.get("matching", tk.StringVar(value="greedy")).get()
+        args.appearance_tiebreak = getb("appearance_tiebreak")
         args.roi_mode = "none"
         args.roi_border_frac = 0.06
         args.roi_border_px = None
@@ -1240,14 +1612,14 @@ class PreviewApp:
         args.auto_scale = True
         args.ref_width = 640
         args.min_kernel = 3
-        args.min_inliers = 3
+        args.min_inliers = getv("min_inliers", int)
         args.post_id_resolve = False
         args.template_bank_source = "default"
         args.template_bank_path = None
         args.bank_select_metric = "strict"
         args.template_build_mode = "procrustes"
         args.verbose_template = False
-        args.match_tol = 10.0
+        args.match_tol = getv("match_tol", float)
         args.mirror = bool(self.mirror_var.get())
 
         # overrides from loaded configs
