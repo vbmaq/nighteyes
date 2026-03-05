@@ -607,6 +607,7 @@ class PreviewApp:
         self.current_preview_base = None
         self.current_preview_base_name = None
         self.current_preview_base_cache_key = None
+        self.overlay_text_var = tk.StringVar(value="")
         self.args_dirty = True
         self.args_cached = None
         self.args_cached_key = None
@@ -1100,14 +1101,29 @@ class PreviewApp:
         add_field("temporal_w_rot", "temporal_w_rot", 1.0, parent=grp_temporal)
         add_field("temporal_w_trans", "temporal_w_trans", 1.0, parent=grp_temporal)
 
-        # Preview panel
-        self.canvas = tk.Canvas(paned, bg="#111", width=900, height=700, highlightthickness=1, highlightbackground="#444")
+        # Preview panel (title + canvas)
+        preview_container = ttk.Frame(paned)
+        overlay_label = tk.Label(
+            preview_container,
+            textvariable=self.overlay_text_var,
+            anchor="w",
+            justify=tk.LEFT,
+            bg="#111",
+            fg="#ddd",
+            font=("Segoe UI", 9),
+            padx=6,
+            pady=4,
+        )
+        overlay_label.pack(fill=tk.X)
+
+        self.canvas = tk.Canvas(preview_container, bg="#111", width=900, height=700, highlightthickness=1, highlightbackground="#444")
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
 
         paned.add(ctrl_container, weight=0)
-        paned.add(self.canvas, weight=1)
+        paned.add(preview_container, weight=1)
 
         # Correction panel (hidden unless enabled)
         self.corr_frame = ttk.Frame(ctrl, padding=(0, 4, 0, 0))
@@ -1405,18 +1421,8 @@ class PreviewApp:
             preview_key = self._preview_key(args, compute_key)
             preview_base = self._ensure_current_preview_base(fp, args, preview_key)
             if status != "ok":
+                self.overlay_text_var.set(f"{fp.name} | SKIPPED (pupil ROI)")
                 overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-                if bool(getattr(args, "show_overlay", True)):
-                    cv2.putText(
-                        overlay,
-                        "SKIPPED (pupil ROI)",
-                        (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 200, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
                 overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
             else:
                 title = (
@@ -1425,6 +1431,7 @@ class PreviewApp:
                 )
                 if args.temporal:
                     title += " | temporal"
+                self.overlay_text_var.set(title)
 
                 roi_rect = entry.get("roi_rect")
                 use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
@@ -1443,7 +1450,7 @@ class PreviewApp:
                         cand_xy_disp,
                         T_hat_draw,
                         matches_draw,
-                        title_text=title,
+                        title_text="",
                         gt_xy=None,
                         match_tol=args.match_tol,
                     )
@@ -2556,6 +2563,7 @@ class PreviewApp:
                 quick_rgb = None
             if quick_rgb is not None:
                 self._set_canvas_rgb(quick_rgb)
+                self.overlay_text_var.set(f"{fp.name} | caching…")
                 self.current_fp = fp
                 self.current_matches = []
                 self.current_cand_xy = np.empty((0, 2), dtype=float)
