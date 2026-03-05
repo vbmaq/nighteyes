@@ -28,10 +28,11 @@ This repository implements a constellation-based matching pipeline inspired by s
 
 ### Pipeline Stages
 
-1. Candidate detection
-2. Candidate scoring
-3. Geometric constellation matching
-4. Identity assignment and evaluation
+1. Image enhancement
+2. Candidate detection
+3. Candidate scoring
+4. Geometric constellation matching
+5. Identity assignment and evaluation
 
 ## Repository Layout
 
