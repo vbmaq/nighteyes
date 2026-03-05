@@ -141,7 +141,7 @@ If you use this code in academic work, please cite the associated paper:
 
 ## License
 
-License is currently unspecified. Add a `LICENSE` file to clarify permitted use.
+License is currently unspecified.
 
 ## Acknowledgements
 
