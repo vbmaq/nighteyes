@@ -65,16 +65,16 @@ Notes:
 - Python 3.9+ is recommended.
 - UI tools use Tkinter (included with many Python distributions; on some platforms it may require an additional system package).
 
-## Running
+## Running on Chugh et al. dataset 
 
 To run the pipeline on the Chugh et al.[3] dataset, first download their dataset here: https://www.eecg.utoronto.ca/~jayar/datasets/xreyetrack.html
 
-Then run the following (adjust file paths where necessary):
-
+Then run the command below (the default template comes pre-loaded, just load the image folder containing Chugh et al.'s dataset. You can also find sample frames from the dataset in `data/chugh_samples`.   
 ```bash
-python glint_pipeline_eval_gen.py "data\LabelledImages\dataset" --labels "data\label.txt" --matcher sla --template_mode bank --template_bank_source default --bank_select_metric strict --template_build_mode procrustes --matching greedy --match_tol 10 --kernel 11 --median_ksize 3 --percentile 99.7 --eps 6 --iters 4000 --min_k 3 --min_inliers 3 --max_pool 30 --min_area 8 --max_area 250 --min_circ 0.45 --min_maxI 200 --auto_scale --ref_width 640 --scale_min 0.6 --scale_max 1.6 --score2_mode contrast_support --contrast_r_inner 3 --contrast_r_outer1 5 --contrast_r_outer2 8 --dog_sigma1 1.0 --dog_sigma2 2.2 --support_M 20 --support_tol 0.08 --support_w 0.1 --cand_fallback --cand_target_raw 8 --cand_fallback_passes 4 --cand_fallback_percentiles "99,98,97" --cand_fallback_kernel_add 0 --cand_merge_eps 2.0 --ratio_tol 0.10 --pivot_P 6 --max_seeds 100 --sla_semantic_prior --sla_semantic_lambda 1.5 --sla_mirror_reject --viz_metrics --save_glints_npz "data\glints.npz"
+python glint_pipeline_preview_ui.py
 ```
 
+## Running general
 Review and correct annotations by using:
 ```bash
 python glint_pupil_annotation_review_ui.py --help
