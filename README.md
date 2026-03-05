@@ -132,10 +132,10 @@ csv/        # Evaluation metrics for downstream analysis
 
 
 ## To-Do's 
-- optimize glint UI
-- add stereo capabilities
-- improve Correction mode
-- improve built-in pupil detection methods
+⏳ optimize glint UI
+⏳ add stereo capabilities
+⏳ improve Correction mode
+⏳ improve built-in pupil detection methods
 
 ## Reproducibility
 
@@ -143,7 +143,7 @@ This repository includes the components used for reproducible evaluation and ben
 
 ## Citation
 
-If you use this code in academic work, please cite the associated paper:
+If you used our work, please cite this paper:
 
 > Paper citation placeholder
 
