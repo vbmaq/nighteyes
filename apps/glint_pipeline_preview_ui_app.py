@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 import json
+import hashlib
+import logging
 import cv2
 import numpy as np
 import re
@@ -12,6 +14,8 @@ import tempfile
 import zipfile
 import shutil
 import time
+import sys
+from collections import OrderedDict
 
 from glint_pipeline import eval_gen as g
 from glint_pipeline.temporal import MultiGlintTracker
@@ -21,6 +25,189 @@ try:
     from PIL import Image, ImageTk
 except ImportError as exc:
     raise SystemExit("Pillow is required. Install with: python -m pip install pillow") from exc
+
+
+_LOGGER = logging.getLogger(__name__)
+if not _LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+_OVERLAY_CACHE_MAX = 32
+
+# Whitelist of args that affect compute results (detection/scoring/matching/temporal).
+_COMPUTE_ATTRS = (
+    "matcher",
+    "template_mode",
+    "score2_mode",
+    "ml_model_path",
+    "percentile",
+    "kernel",
+    "enhance_mode",
+    "enhance_enable",
+    "median_ksize",
+    "denoise",
+    "denoise_k",
+    "clahe",
+    "clahe_clip",
+    "clahe_tiles",
+    "gamma",
+    "unsharp",
+    "unsharp_amount",
+    "unsharp_sigma",
+    "minmax",
+    "clean_k",
+    "open_iter",
+    "close_iter",
+    "eps",
+    "max_pool",
+    "min_area",
+    "max_area",
+    "min_circ",
+    "min_maxI",
+    "cand_fallback",
+    "cand_target_raw",
+    "cand_fallback_passes",
+    "cand_fallback_percentiles",
+    "cand_fallback_kernel_add",
+    "cand_merge_eps",
+    "support_M",
+    "support_tol",
+    "support_w",
+    "contrast_r_inner",
+    "contrast_r_outer1",
+    "contrast_r_outer2",
+    "dog_sigma1",
+    "dog_sigma2",
+    "ratio_tol",
+    "pivot_P",
+    "max_seeds",
+    "grow_resid_max",
+    "layout_prior",
+    "layout_lambda",
+    "layout_mode",
+    "sla_layout_prior",
+    "sla_layout_lambda",
+    "sla_layout_mode",
+    "sla_semantic_prior",
+    "sla_semantic_mode",
+    "sla_semantic_lambda",
+    "sla_semantic_hard",
+    "sla_mirror_reject",
+    "sla_top2_margin",
+    "sla_base_ratio_min",
+    "sla_side_margin",
+    "sla_scale_min",
+    "sla_scale_max",
+    "sla_g0_top2",
+    "sla_w_seed_score2",
+    "sla_w_seed_geom",
+    "max_seeds_per_pivot",
+    "sla_adaptive_ratio_tol",
+    "sla_ratio_tol_min",
+    "sla_ratio_tol_refN",
+    "temporal",
+    "temporal_prior",
+    "temporal_gate_px",
+    "temporal_max_missed",
+    "temporal_lambda",
+    "temporal_w_scale",
+    "temporal_w_rot",
+    "temporal_w_trans",
+    "temporal_use_tracks_for_matching",
+    "temporal_roi_radius",
+    "vote_M",
+    "vote_ratio_tol",
+    "vote_max_hyp",
+    "vote_w_score2",
+    "min_k",
+    "iters",
+    "seed",
+    "scale_min",
+    "scale_max",
+    "disable_scale_gate",
+    "matching",
+    "appearance_tiebreak",
+    "roi_mode",
+    "roi_border_frac",
+    "roi_border_px",
+    "pupil_roi",
+    "pupil_roi_size",
+    "pupil_roi_pad_mode",
+    "pupil_roi_pad_value",
+    "pupil_roi_fail_policy",
+    "pupil_source",
+    "pupil_axis_mode",
+    "pupil_dark_thresh",
+    "pupil_min_area",
+    "pupil_rmin",
+    "pupil_rmax",
+    "pupil_fallback_center",
+    "pupil_method",
+    "pupil_radii",
+    "pupil_sigma_frac",
+    "pupil_fail_open",
+    "pupil_force_gate",
+    "pupil_npz",
+    "auto_scale",
+    "ref_width",
+    "min_kernel",
+    "min_inliers",
+    "template_bank_source",
+    "template_bank_path",
+    "bank_select_metric",
+    "template_build_mode",
+    "mirror",
+)
+
+
+def _stable_json_dumps(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _hash_payload(payload: dict) -> str:
+    blob = _stable_json_dumps(payload)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _file_fingerprint(path: str | None) -> dict | None:
+    if not path:
+        return None
+    p = Path(path)
+    try:
+        stat = p.stat()
+        return {"path": str(p.resolve()), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    except Exception:
+        return {"path": str(p)}
+
+
+def _default_template_path() -> str:
+    try:
+        return str(Path(__file__).resolve().parents[1] / "templates" / "default_templates.json")
+    except Exception:
+        return "templates/default_templates.json"
+
+
+def _compute_key_payload(args, templates_path: str | None, image_config_path: str | None, pupil_npz_path: str | None) -> dict:
+    payload = {}
+    for key in _COMPUTE_ATTRS:
+        payload[key] = getattr(args, key, None)
+    if getattr(args, "template_bank_source", None) == "custom":
+        payload["template_bank_file"] = _file_fingerprint(getattr(args, "template_bank_path", None) or templates_path)
+    else:
+        payload["template_bank_file"] = _file_fingerprint(_default_template_path())
+    payload["image_config_file"] = _file_fingerprint(image_config_path or getattr(args, "image_config", None))
+    payload["pupil_npz_file"] = _file_fingerprint(pupil_npz_path or getattr(args, "pupil_npz", None))
+    return payload
+
+
+def _overlay_key_payload(args, overrides_key, corr_mode: bool) -> dict:
+    return {
+        "show_overlay": bool(getattr(args, "show_overlay", True)),
+        "preview_enhanced": bool(getattr(args, "preview_enhanced", False)),
+        "pupil_roi_debug": bool(getattr(args, "pupil_roi_debug", False)),
+        "match_tol": float(getattr(args, "match_tol", 0.0)),
+        "corr_mode": bool(corr_mode),
+        "overrides": overrides_key,
+    }
 
 
 _MP_SAVE_STATE = {}
@@ -336,8 +523,11 @@ class PreviewApp:
         self.last_idx = None
         self.last_good_pupil = None
         self.bulk_processing = False
-        self.frame_cache = {}
-        self.cache_key = None
+        # Two-level caching: compute results per frame+compute_key, overlay LRU for renders.
+        self.compute_cache = {}
+        self.overlay_cache = OrderedDict()
+        self.overlay_cache_max = _OVERLAY_CACHE_MAX
+        self.compute_key = None
         self.cache_lock = threading.Lock()
         self.cache_thread = None
         self.cache_token = 0
@@ -648,11 +838,51 @@ class PreviewApp:
                     matches_disp.append((int(ti), int(new_ci), d))
         return cand_xy_disp, matches_disp
 
-    def _ensure_current_preview_base(self, fp: Path, args, cache_key: str) -> np.ndarray:
+    def _frame_id(self, fp: Path) -> str:
+        try:
+            return str(fp.resolve())
+        except Exception:
+            return str(fp)
+
+    def _preview_key(self, args, compute_key: str) -> str:
+        return f"{compute_key}|preview={int(bool(getattr(args, 'preview_enhanced', False)))}"
+
+    def _compute_key(self, args) -> str:
+        payload = _compute_key_payload(args, self.templates_path, self.image_config_path, self.pupil_npz_path)
+        return _hash_payload(payload)
+
+    def _overlay_key(self, args, frame_name: str) -> str:
+        overrides_key = self._overrides_key(frame_name)
+        payload = _overlay_key_payload(args, overrides_key, bool(self.corr_mode.get()))
+        return _hash_payload(payload)
+
+    def _get_compute_entry(self, frame_id: str, compute_key: str):
+        with self.cache_lock:
+            return self.compute_cache.get(frame_id, {}).get(compute_key)
+
+    def _set_compute_entry(self, frame_id: str, compute_key: str, entry: dict) -> None:
+        with self.cache_lock:
+            self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+
+    def _overlay_cache_get(self, key):
+        with self.cache_lock:
+            if key in self.overlay_cache:
+                self.overlay_cache.move_to_end(key)
+                return self.overlay_cache[key]
+        return None
+
+    def _overlay_cache_set(self, key, value) -> None:
+        with self.cache_lock:
+            self.overlay_cache[key] = value
+            self.overlay_cache.move_to_end(key)
+            while len(self.overlay_cache) > int(self.overlay_cache_max):
+                self.overlay_cache.popitem(last=False)
+
+    def _ensure_current_preview_base(self, fp: Path, args, preview_key: str) -> np.ndarray:
         if (
             self.current_preview_base is not None
             and self.current_preview_base_name == fp.name
-            and self.current_preview_base_cache_key == cache_key
+            and self.current_preview_base_cache_key == preview_key
         ):
             return self.current_preview_base
         bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
@@ -687,10 +917,10 @@ class PreviewApp:
             )
         self.current_preview_base = preview_base
         self.current_preview_base_name = fp.name
-        self.current_preview_base_cache_key = cache_key
+        self.current_preview_base_cache_key = preview_key
         return preview_base
 
-    def _quick_preview_rgb(self, fp: Path, args, cache_key: str) -> np.ndarray | None:
+    def _quick_preview_rgb(self, fp: Path, args, preview_key: str) -> np.ndarray | None:
         bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
         if bgr is None:
             return None
@@ -699,11 +929,12 @@ class PreviewApp:
         gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         self.current_preview_base = gray_full
         self.current_preview_base_name = fp.name
-        self.current_preview_base_cache_key = cache_key
+        self.current_preview_base_cache_key = preview_key
         return cv2.cvtColor(gray_full, cv2.COLOR_GRAY2RGB)
 
-    def _start_ondemand_cache_compute(self, fp: Path, frame_idx: int, args, cache_key: str) -> None:
-        key = (cache_key, fp.name)
+    def _start_ondemand_cache_compute(self, fp: Path, frame_idx: int, args, compute_key: str) -> None:
+        frame_id = self._frame_id(fp)
+        key = (compute_key, frame_id)
         with self.ondemand_lock:
             if len(self.ondemand_inflight) >= 2:
                 return
@@ -712,6 +943,8 @@ class PreviewApp:
             self.ondemand_inflight.add(key)
 
         args_snapshot = types.SimpleNamespace(**vars(args))
+        with self.cache_lock:
+            token = self.cache_token
 
         def worker():
             try:
@@ -735,11 +968,12 @@ class PreviewApp:
                 entry = self._compute_cache_entry(fp, frame_idx, args_snapshot, cache_state)
                 if entry is None:
                     return
-                if cache_key != self.cache_key:
-                    return
                 with self.cache_lock:
-                    # Don't clobber a fresher entry if it already exists.
-                    self.frame_cache.setdefault(fp.name, entry)
+                    if token != self.cache_token or compute_key != self.compute_key:
+                        return
+                    self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+            except Exception:
+                _LOGGER.exception("On-demand cache compute failed for %s", frame_id)
             finally:
                 with self.ondemand_lock:
                     self.ondemand_inflight.discard(key)
@@ -750,93 +984,103 @@ class PreviewApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _render_overlay_for_entry(self, fp: Path, entry: dict, args, cache_key: str) -> None:
-        overrides_key = self._overrides_key(fp.name)
-        mode = "corr" if self.corr_mode.get() else "normal"
-        if (
-            entry.get("overlay_key") == overrides_key
-            and entry.get("overlay_mode") == mode
-            and entry.get("overlay_rgb") is not None
-        ):
-            return
+    def _render_overlay_for_entry(
+        self,
+        fp: Path,
+        frame_id: str,
+        entry: dict,
+        args,
+        compute_key: str,
+    ):
+        overlay_key = self._overlay_key(args, fp.name)
+        overlay_cache_key = (frame_id, compute_key, overlay_key)
+        overlay_rgb = self._overlay_cache_get(overlay_cache_key)
+        overlay_hit = overlay_rgb is not None
 
-        preview_base = self._ensure_current_preview_base(fp, args, cache_key)
+        status = entry.get("status", "ok")
         cand_xy_base = entry.get("cand_xy_base")
         matches_base = entry.get("matches_base")
         T_hat = entry.get("T_hat")
         tracked_xy = entry.get("tracked_xy")
 
-        if cand_xy_base is None:
+        if status == "ok" and cand_xy_base is None:
             raise RuntimeError("Cache entry missing cand_xy_base")
 
-        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy_base, matches_base, T_hat)
+        if status == "ok":
+            cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy_base, matches_base, T_hat)
+        else:
+            cand_xy_disp = np.empty((0, 2), dtype=float)
+            matches_disp = []
 
-        title = f"{fp.name} | matcher={args.matcher} | inliers={entry.get('inliers', 0)} | err={entry.get('mean_err', float('nan')):.2f}px"
-        if args.temporal:
-            title += " | temporal"
-
-        if not args.show_overlay:
-            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-            if args.pupil_roi_debug and entry.get("roi_rect") is not None:
-                ox, oy, sz = entry["roi_rect"]
-                cv2.rectangle(
-                    overlay,
-                    (int(round(ox)), int(round(oy))),
-                    (int(round(ox + sz)), int(round(oy + sz))),
-                    (0, 200, 255),
-                    2,
+        if overlay_rgb is None:
+            preview_key = self._preview_key(args, compute_key)
+            preview_base = self._ensure_current_preview_base(fp, args, preview_key)
+            if status != "ok":
+                overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
+                if bool(getattr(args, "show_overlay", True)):
+                    cv2.putText(
+                        overlay,
+                        "SKIPPED (pupil ROI)",
+                        (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 200, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            else:
+                title = (
+                    f"{fp.name} | matcher={args.matcher} | inliers={entry.get('inliers', 0)} | "
+                    f"err={entry.get('mean_err', float('nan')):.2f}px"
                 )
-            overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-            entry["overlay_rgb"] = overlay_rgb
-            entry["cand_xy"] = cand_xy_disp
-            entry["matches"] = matches_disp
-            entry["overlay_key"] = overrides_key
-            entry["overlay_mode"] = mode
-            return
+                if args.temporal:
+                    title += " | temporal"
 
-        matches_draw = matches_disp
-        T_hat_draw = T_hat
-        use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
-        if use_temporal_display and tracked_xy is not None:
-            if np.isfinite(tracked_xy).any():
-                T_hat_draw = tracked_xy
-                T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-            matches_draw = []
+                roi_rect = entry.get("roi_rect")
+                use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
+                matches_draw = matches_disp
+                if not args.show_overlay:
+                    overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
+                else:
+                    T_hat_draw = T_hat
+                    if use_temporal_display and tracked_xy is not None:
+                        if np.isfinite(tracked_xy).any():
+                            T_hat_draw = tracked_xy
+                            T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
+                        matches_draw = []
+                    overlay = g.draw_overlay(
+                        preview_base,
+                        cand_xy_disp,
+                        T_hat_draw,
+                        matches_draw,
+                        title_text=title,
+                        gt_xy=None,
+                        match_tol=args.match_tol,
+                    )
+                if args.pupil_roi_debug and roi_rect is not None:
+                    ox, oy, sz = roi_rect
+                    cv2.rectangle(
+                        overlay,
+                        (int(round(ox)), int(round(oy))),
+                        (int(round(ox + sz)), int(round(oy + sz))),
+                        (0, 200, 255),
+                        2,
+                    )
+                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            self._overlay_cache_set(overlay_cache_key, overlay_rgb)
 
-        overlay = g.draw_overlay(
-            preview_base,
-            cand_xy_disp,
-            T_hat_draw,
-            matches_draw,
-            title_text=title,
-            gt_xy=None,
-            match_tol=args.match_tol,
-        )
-        if args.pupil_roi_debug and entry.get("roi_rect") is not None:
-            ox, oy, sz = entry["roi_rect"]
-            cv2.rectangle(
-                overlay,
-                (int(round(ox)), int(round(oy))),
-                (int(round(ox + sz)), int(round(oy + sz))),
-                (0, 200, 255),
-                2,
-            )
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-        entry["overlay_rgb"] = overlay_rgb
-        entry["cand_xy"] = cand_xy_disp
-        entry["matches"] = matches_disp if self.corr_mode.get() else matches_draw
-        entry["overlay_key"] = overrides_key
-        entry["overlay_mode"] = mode
+        return overlay_rgb, matches_disp, cand_xy_disp, overlay_hit
 
-    def _get_args_and_cache_key(self):
+    def _get_args_and_compute_key(self):
         if not self.args_dirty and self.args_cached is not None and self.args_cached_key is not None:
             return self.args_cached, self.args_cached_key
         args = self._get_args()
-        cache_key = self._settings_cache_key(args)
+        compute_key = self._compute_key(args)
         self.args_cached = args
-        self.args_cached_key = cache_key
+        self.args_cached_key = compute_key
         self.args_dirty = False
-        return args, cache_key
+        return args, compute_key
 
     def _get_args(self):
         # Build a Namespace compatible with g.run_matcher_for_template and helpers
@@ -998,15 +1242,9 @@ class PreviewApp:
 
         return args
 
-    def _settings_cache_key(self, args) -> str:
-        cfg = {k: getattr(args, k) for k in dir(args) if not k.startswith("_")}
-        cfg["templates_path"] = self.templates_path
-        cfg["image_config_path"] = self.image_config_path
-        cfg["pupil_npz_path"] = self.pupil_npz_path
-        return json.dumps(cfg, sort_keys=True, default=str)
-
     def _on_settings_change(self, *_args) -> None:
         self.args_dirty = True
+        self._request_render(0)
         self._schedule_cache_rebuild()
 
     def _schedule_cache_rebuild(self) -> None:
@@ -1023,14 +1261,16 @@ class PreviewApp:
         if not self.files or self.bulk_processing:
             return
         args_snapshot = self._get_args()
-        cache_key = self._settings_cache_key(args_snapshot)
-        if cache_key == self.cache_key and self.frame_cache:
-            return
-        self.cache_key = cache_key
-        self.frame_cache = {}
-        self.cache_token += 1
-        token = self.cache_token
-        self.cache_building = True
+        compute_key = self._compute_key(args_snapshot)
+        with self.cache_lock:
+            if compute_key == self.compute_key and self.compute_cache:
+                return
+            self.compute_key = compute_key
+            self.compute_cache = {}
+            self.overlay_cache.clear()
+            self.cache_token += 1
+            token = self.cache_token
+            self.cache_building = True
         self.status_var.set("Precomputing cache (0%)...")
         self.cache_progress_var.set(0.0)
         files_snapshot = list(self.files)
@@ -1061,12 +1301,20 @@ class PreviewApp:
                 }
                 total = len(files_snapshot)
                 for i, fp in enumerate(files_snapshot):
-                    if token != self.cache_token:
-                        return
-                    entry = self._compute_cache_entry(fp, i, args_snapshot, cache_state)
+                    with self.cache_lock:
+                        if token != self.cache_token or compute_key != self.compute_key:
+                            return
+                    frame_id = self._frame_id(fp)
+                    try:
+                        entry = self._compute_cache_entry(fp, i, args_snapshot, cache_state)
+                    except Exception:
+                        _LOGGER.exception("Cache compute failed for %s", frame_id)
+                        continue
                     if entry is not None:
                         with self.cache_lock:
-                            self.frame_cache[fp.name] = entry
+                            if token != self.cache_token or compute_key != self.compute_key:
+                                return
+                            self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
                     if (i + 1) % 2 == 0:
                         time.sleep(0)
                     if (i + 1) % 10 == 0 or i + 1 == total:
@@ -1076,8 +1324,10 @@ class PreviewApp:
                         ))
                         self.root.after(0, lambda p=pct: self.cache_progress_var.set(float(p)))
             finally:
+                with self.cache_lock:
+                    if token == self.cache_token:
+                        self.cache_building = False
                 if token == self.cache_token:
-                    self.cache_building = False
                     self.root.after(0, lambda: self.cache_progress_var.set(100.0))
                     self.root.after(0, self._request_render)
 
@@ -1145,7 +1395,17 @@ class PreviewApp:
                 cache_state["last_good_pupil"],
             )
             if roi_decision.action == "skip":
-                return None
+                return {
+                    "status": "skipped",
+                    "reason": "pupil_roi_skip",
+                    "cand_xy_base": np.empty((0, 2), dtype=float),
+                    "matches_base": [],
+                    "T_hat": None,
+                    "tracked_xy": None,
+                    "inliers": 0,
+                    "mean_err": float("nan"),
+                    "roi_rect": None,
+                }
             if roi_decision.action == "use" and roi_decision.center is not None:
                 roi_info = compute_pupil_roi(
                     gray_full,
@@ -1158,30 +1418,6 @@ class PreviewApp:
                 roi_active = True
                 if roi_decision.center is not None:
                     cache_state["last_good_pupil"] = (roi_decision.center[0], roi_decision.center[1], pr)
-
-        preview_base = gray_full
-        if getattr(args, "preview_enhanced", False):
-            kernel_eff = int(params["kernel_eff"])
-            median_ksize_eff = int(params["median_ksize_eff"])
-            preview_base = g.enhance_for_glints(
-                gray_full,
-                kernel_size=kernel_eff,
-                median_ksize=median_ksize_eff,
-                clahe_clip=args.clahe_clip,
-                clahe_tiles=args.clahe_tiles,
-                denoise=int(getattr(args, "denoise", 1)),
-                denoise_k=int(getattr(args, "denoise_k", 0)),
-                clahe_enable=int(getattr(args, "clahe", 1)),
-                gamma=float(getattr(args, "gamma", 1.0)),
-                unsharp=int(getattr(args, "unsharp", 0)),
-                unsharp_amount=float(getattr(args, "unsharp_amount", 1.0)),
-                unsharp_sigma=float(getattr(args, "unsharp_sigma", 1.0)),
-                enhance_mode=str(getattr(args, "enhance_mode", "tophat")),
-                dog_sigma1=float(getattr(args, "dog_sigma1", 1.0)),
-                dog_sigma2=float(getattr(args, "dog_sigma2", 2.2)),
-                minmax=int(getattr(args, "minmax", 1)),
-                enhance_enable=int(getattr(args, "enhance_enable", 1)),
-            )
 
         cand_xy_pass0, rows_pass0, cand_score2_pass0, cand_raw_pass0, cand_support_pass0 = g.detect_candidates_one_pass(
             gray, params, args, d_expected=cache_state["d_expected"]
@@ -1346,64 +1582,12 @@ class PreviewApp:
                 meas_labeled[:4] = T_hat[:4]
             tracked_xy, _meta = cache_state["temporal_tracker"].step_labeled(meas_labeled, frame_idx)
 
-        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
-
-        title = f"{fp.name} | matcher={args.matcher} | inliers={inliers} | err={mean_err:.2f}px"
-        if args.temporal:
-            title += " | temporal"
         roi_rect = None
         if roi_info is not None:
             roi_rect = (float(roi_info.offset_x), float(roi_info.offset_y), float(int(args.pupil_roi_size)))
 
-        if not args.show_overlay:
-            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-            if args.pupil_roi_debug and roi_rect is not None:
-                ox, oy, sz = roi_rect
-                cv2.rectangle(
-                    overlay,
-                    (int(round(ox)), int(round(oy))),
-                    (int(round(ox + sz)), int(round(oy + sz))),
-                    (0, 200, 255),
-                    2,
-                )
-            overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-            return {
-                "overlay_rgb": overlay_rgb,
-                "matches": matches_disp,
-                "cand_xy": cand_xy_disp,
-                "cand_xy_base": cand_xy,
-                "matches_base": matches,
-                "T_hat": T_hat,
-                "tracked_xy": tracked_xy,
-                "inliers": inliers,
-                "mean_err": mean_err,
-                "roi_rect": roi_rect,
-                "overlay_key": self._overrides_key(fp.name),
-                "overlay_mode": "normal",
-            }
-
-        matches_draw = matches_disp
-        T_hat_draw = T_hat
-        if args.temporal and tracked_xy is not None:
-            if np.isfinite(tracked_xy).any():
-                T_hat_draw = tracked_xy
-                T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-            matches_draw = []
-        overlay = g.draw_overlay(preview_base, cand_xy_disp, T_hat_draw, matches_draw, title_text=title, gt_xy=None, match_tol=args.match_tol)
-        if args.pupil_roi_debug and roi_rect is not None:
-            ox, oy, sz = roi_rect
-            cv2.rectangle(
-                overlay,
-                (int(round(ox)), int(round(oy))),
-                (int(round(ox + sz)), int(round(oy + sz))),
-                (0, 200, 255),
-                2,
-            )
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         return {
-            "overlay_rgb": overlay_rgb,
-            "matches": matches_draw,
-            "cand_xy": cand_xy_disp,
+            "status": "ok",
             "cand_xy_base": cand_xy,
             "matches_base": matches,
             "T_hat": T_hat,
@@ -1411,14 +1595,15 @@ class PreviewApp:
             "inliers": inliers,
             "mean_err": mean_err,
             "roi_rect": roi_rect,
-            "overlay_key": self._overrides_key(fp.name),
-            "overlay_mode": "normal",
         }
 
-    def _invalidate_cache_for_frame(self, name: str) -> None:
+    def _invalidate_cache_for_frame(self, frame_id: str) -> None:
         with self.cache_lock:
-            if name in self.frame_cache:
-                self.frame_cache.pop(name, None)
+            self.compute_cache.pop(frame_id, None)
+            if self.overlay_cache:
+                stale = [key for key in self.overlay_cache.keys() if key[0] == frame_id]
+                for key in stale:
+                    self.overlay_cache.pop(key, None)
 
     def load_templates_json(self) -> None:
         path = filedialog.askopenfilename(
@@ -1655,6 +1840,8 @@ class PreviewApp:
         if bgr is None:
             return
         args = args_override if args_override is not None else self._get_args()
+        frame_id = self._frame_id(fp)
+        compute_key = self._compute_key(args)
         if bool(getattr(args, "mirror", False)):
             bgr = cv2.flip(bgr, 1)
         gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -1688,6 +1875,30 @@ class PreviewApp:
                 self.last_good_pupil,
             )
             if roi_decision.action == "skip":
+                entry = {
+                    "status": "skipped",
+                    "reason": "pupil_roi_skip",
+                    "cand_xy_base": np.empty((0, 2), dtype=float),
+                    "matches_base": [],
+                    "T_hat": None,
+                    "tracked_xy": None,
+                    "inliers": 0,
+                    "mean_err": float("nan"),
+                    "roi_rect": None,
+                }
+                with self.cache_lock:
+                    if compute_key == self.compute_key:
+                        self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+                if draw:
+                    overlay_rgb, matches_disp, cand_xy_disp, _overlay_hit = self._render_overlay_for_entry(
+                        fp, frame_id, entry, args, compute_key
+                    )
+                    self._set_canvas_rgb(overlay_rgb)
+                    self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (skipped)")
+                    self.current_fp = fp
+                    self.current_matches = matches_disp
+                    self.current_cand_xy = cand_xy_disp
+                    self._refresh_detection_list()
                 return
             if roi_decision.action == "use" and roi_decision.center is not None:
                 roi_info = compute_pupil_roi(
@@ -1703,30 +1914,6 @@ class PreviewApp:
                     self.last_good_pupil = (roi_decision.center[0], roi_decision.center[1], roi_decision.radius)
                 else:
                     self.last_good_pupil = (roi_decision.center[0], roi_decision.center[1], float("nan"))
-
-        preview_base = gray_full
-        if getattr(args, "preview_enhanced", False):
-            kernel_eff = int(params["kernel_eff"])
-            median_ksize_eff = int(params["median_ksize_eff"])
-            preview_base = g.enhance_for_glints(
-                gray_full,
-                kernel_size=kernel_eff,
-                median_ksize=median_ksize_eff,
-                clahe_clip=args.clahe_clip,
-                clahe_tiles=args.clahe_tiles,
-                denoise=int(getattr(args, "denoise", 1)),
-                denoise_k=int(getattr(args, "denoise_k", 0)),
-                clahe_enable=int(getattr(args, "clahe", 1)),
-                gamma=float(getattr(args, "gamma", 1.0)),
-                unsharp=int(getattr(args, "unsharp", 0)),
-                unsharp_amount=float(getattr(args, "unsharp_amount", 1.0)),
-                unsharp_sigma=float(getattr(args, "unsharp_sigma", 1.0)),
-                enhance_mode=str(getattr(args, "enhance_mode", "tophat")),
-                dog_sigma1=float(getattr(args, "dog_sigma1", 1.0)),
-                dog_sigma2=float(getattr(args, "dog_sigma2", 2.2)),
-                minmax=int(getattr(args, "minmax", 1)),
-                enhance_enable=int(getattr(args, "enhance_enable", 1)),
-            )
 
         cand_xy_pass0, rows_pass0, cand_score2_pass0, cand_raw_pass0, cand_support_pass0 = g.detect_candidates_one_pass(
             gray, params, args, d_expected=self.d_expected
@@ -1845,8 +2032,6 @@ class PreviewApp:
         else:
             self.template_by_image[fp.name] = np.full((best_template_xy.shape[0], 2), np.nan, dtype=float)
 
-        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
-
         tracked_xy = None
         if update_tracker and args.temporal:
             if self.temporal_tracker is None:
@@ -1856,18 +2041,22 @@ class PreviewApp:
                     max_missed=args.temporal_max_missed,
                 )
             meas_labeled = np.full((4, 2), np.nan, dtype=float)
-            for ti, ci, _ in matches_disp:
+            for ti, ci, _ in (matches or []):
                 if int(ti) >= 4:
                     continue
-                meas_labeled[int(ti)] = cand_xy_disp[int(ci)]
+                meas_labeled[int(ti)] = cand_xy[int(ci)]
             # If no labeled matches, fall back to top candidates (unordered)
-            if not np.isfinite(meas_labeled).any() and len(cand_xy_disp) > 0:
-                k = min(4, len(cand_xy_disp))
-                meas_labeled[:k] = cand_xy_disp[:k]
+            if not np.isfinite(meas_labeled).any() and len(cand_xy) > 0:
+                k = min(4, len(cand_xy))
+                meas_labeled[:k] = cand_xy[:k]
             # If still empty but we have a hypothesis, seed from T_hat
             if not np.isfinite(meas_labeled).any() and T_hat is not None and T_hat.shape[0] >= 4:
                 meas_labeled[:4] = T_hat[:4]
             tracked_xy, _meta = self.temporal_tracker.step_labeled(meas_labeled, frame_idx)
+
+        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
+
+        if update_tracker and args.temporal:
             if np.isfinite(tracked_xy).any():
                 self.glints_by_image[fp.name] = tracked_xy
             elif T_hat is not None:
@@ -1886,73 +2075,32 @@ class PreviewApp:
                     glint_xy[int(ti)] = cand_xy_disp[int(ci)]
             self.glints_by_image[fp.name] = glint_xy
 
-        if not draw:
-            return
-
-        title = f"{fp.name} | matcher={args.matcher} | inliers={inliers} | err={mean_err:.2f}px"
-        if args.temporal:
-            title += " | temporal"
         roi_rect = None
         if roi_info is not None:
             roi_rect = (float(roi_info.offset_x), float(roi_info.offset_y), float(int(args.pupil_roi_size)))
-        use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
-        matches_draw = matches_disp
-        if not args.show_overlay:
-            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-        else:
-            T_hat_draw = T_hat
-            if use_temporal_display and tracked_xy is not None:
-                if np.isfinite(tracked_xy).any():
-                    T_hat_draw = tracked_xy
-                    T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-                matches_draw = []
-            overlay = g.draw_overlay(
-                preview_base,
-                cand_xy_disp,
-                T_hat_draw,
-                matches_draw,
-                title_text=title,
-                gt_xy=None,
-                match_tol=args.match_tol,
-            )
-        if args.pupil_roi_debug and roi_rect is not None:
-            ox, oy, sz = roi_rect
-            cv2.rectangle(
-                overlay,
-                (int(round(ox)), int(round(oy))),
-                (int(round(ox + sz)), int(round(oy + sz))),
-                (0, 200, 255),
-                2,
-            )
 
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-        cache_key = None
-        try:
-            cache_key = self._settings_cache_key(args)
-        except Exception:
-            cache_key = None
-        if cache_key is not None and cache_key == self.cache_key:
-            with self.cache_lock:
-                self.frame_cache[fp.name] = {
-                    "overlay_rgb": overlay_rgb,
-                    "matches": matches_disp if self.corr_mode.get() else matches_draw,
-                    "cand_xy": cand_xy_disp,
-                    "cand_xy_base": cand_xy,
-                    "matches_base": matches,
-                    "T_hat": T_hat,
-                    "tracked_xy": tracked_xy,
-                    "inliers": inliers,
-                    "mean_err": mean_err,
-                    "roi_rect": roi_rect,
-                    "overlay_key": self._overrides_key(fp.name),
-                    "overlay_mode": "corr" if self.corr_mode.get() else "normal",
-                }
-        self.current_preview_base = preview_base
-        self.current_preview_base_name = fp.name
-        self.current_preview_base_cache_key = cache_key
+        entry = {
+            "status": "ok",
+            "cand_xy_base": cand_xy,
+            "matches_base": matches,
+            "T_hat": T_hat,
+            "tracked_xy": tracked_xy,
+            "inliers": inliers,
+            "mean_err": mean_err,
+            "roi_rect": roi_rect,
+        }
+        with self.cache_lock:
+            if compute_key == self.compute_key:
+                self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+
+        if not draw:
+            return
+
+        overlay_rgb, matches_disp, cand_xy_disp, _overlay_hit = self._render_overlay_for_entry(
+            fp, frame_id, entry, args, compute_key
+        )
         self._set_canvas_rgb(overlay_rgb)
-
-        self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name}")
+        self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (computed)")
         self.current_fp = fp
         self.current_matches = matches_disp
         self.current_cand_xy = cand_xy_disp
@@ -1963,50 +2111,63 @@ class PreviewApp:
             return
         if not self.files:
             return
-        args, cache_key = self._get_args_and_cache_key()
-        if args.temporal and self.last_idx is not None and self.idx < self.last_idx:
+        args, compute_key = self._get_args_and_compute_key()
+        fp = self.files[self.idx]
+        frame_id = self._frame_id(fp)
+
+        entry = self._get_compute_entry(frame_id, compute_key)
+        if args.temporal and self.last_idx is not None and self.idx < self.last_idx and entry is None:
             self._reset_temporal()
             for i in range(self.idx):
                 self._process_frame(self.files[i], i, update_tracker=True, draw=False, args_override=args)
-        fp = self.files[self.idx]
-        if cache_key == self.cache_key:
-            with self.cache_lock:
-                entry = self.frame_cache.get(fp.name)
-            if entry is not None:
-                try:
-                    self._render_overlay_for_entry(fp, entry, args, cache_key)
-                except Exception:
-                    pass
-                overlay_rgb = entry.get("overlay_rgb")
-                if overlay_rgb is None:
-                    self._process_frame(fp, self.idx, update_tracker=True, draw=True)
-                    self.last_idx = self.idx
-                    return
-                self._set_canvas_rgb(overlay_rgb)
-                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (cached)")
-                self.current_fp = fp
-                self.current_matches = entry.get("matches", [])
-                self.current_cand_xy = entry.get("cand_xy", np.empty((0, 2), dtype=float))
-                self._refresh_detection_list()
+            entry = self._get_compute_entry(frame_id, compute_key)
+
+        if entry is not None:
+            try:
+                overlay_rgb, matches_disp, cand_xy_disp, overlay_hit = self._render_overlay_for_entry(
+                    fp, frame_id, entry, args, compute_key
+                )
+            except Exception:
+                _LOGGER.exception("Cached render failed for %s", frame_id)
+                overlay_rgb = None
+            if overlay_rgb is None:
+                self._process_frame(fp, self.idx, update_tracker=True, draw=True, args_override=args)
                 self.last_idx = self.idx
                 return
-            if self.cache_building:
-                self._start_ondemand_cache_compute(fp, self.idx, args, cache_key)
+            status_suffix = "cached overlay" if overlay_hit else "cached compute"
+            if entry.get("status") == "skipped":
+                status_suffix = "skipped"
+            self._set_canvas_rgb(overlay_rgb)
+            self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} ({status_suffix})")
+            self.current_fp = fp
+            self.current_matches = matches_disp
+            self.current_cand_xy = cand_xy_disp
+            self._refresh_detection_list()
+            self.last_idx = self.idx
+            return
+
+        with self.cache_lock:
+            cache_building = self.cache_building
+        if cache_building:
+            self._start_ondemand_cache_compute(fp, self.idx, args, compute_key)
+            quick_rgb = None
+            try:
+                preview_key = self._preview_key(args, compute_key)
+                if self.current_preview_base_name != fp.name or self.current_preview_base_cache_key != preview_key:
+                    quick_rgb = self._quick_preview_rgb(fp, args, preview_key)
+            except Exception:
+                _LOGGER.exception("Quick preview failed for %s", frame_id)
                 quick_rgb = None
-                try:
-                    if self.current_preview_base_name != fp.name or self.current_preview_base_cache_key != cache_key:
-                        quick_rgb = self._quick_preview_rgb(fp, args, cache_key)
-                except Exception:
-                    quick_rgb = None
-                if quick_rgb is not None:
-                    self._set_canvas_rgb(quick_rgb)
-                    self.current_fp = fp
-                    self.current_matches = []
-                    self.current_cand_xy = np.empty((0, 2), dtype=float)
-                    self._refresh_detection_list()
-                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (caching...)")
-                self._request_render(100)
-                return
+            if quick_rgb is not None:
+                self._set_canvas_rgb(quick_rgb)
+                self.current_fp = fp
+                self.current_matches = []
+                self.current_cand_xy = np.empty((0, 2), dtype=float)
+                self._refresh_detection_list()
+            self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (caching...)")
+            self._request_render(100)
+            return
+
         self._process_frame(fp, self.idx, update_tracker=True, draw=True, args_override=args)
         self.last_idx = self.idx
 
@@ -2280,5 +2441,59 @@ def main() -> None:
     root.mainloop()
 
 
+def _run_self_checks() -> bool:
+    ok = True
+    print("Running cache self-checks...")
+
+    # 1) Frame id should be unique for same filename in different folders.
+    base_dir = Path(tempfile.mkdtemp())
+    a = base_dir / "a" / "0001.png"
+    b = base_dir / "b" / "0001.png"
+    a.parent.mkdir(parents=True, exist_ok=True)
+    b.parent.mkdir(parents=True, exist_ok=True)
+    frame_id_a = str(a.resolve())
+    frame_id_b = str(b.resolve())
+    if frame_id_a == frame_id_b:
+        print("FAIL: frame_id collision for different paths.")
+        ok = False
+    else:
+        print("OK: frame_id uniqueness.")
+
+    # 2) Overlay-only changes should not change compute key.
+    base_args = types.SimpleNamespace(
+        matcher="sla",
+        template_mode="single",
+        score2_mode="contrast_support",
+        percentile=99.5,
+        kernel=11,
+        median_ksize=3,
+        eps=6.0,
+    )
+    key_base = _hash_payload(_compute_key_payload(base_args, None, None, None))
+    overlay_args = types.SimpleNamespace(**vars(base_args))
+    overlay_args.show_overlay = False
+    overlay_args.preview_enhanced = True
+    key_overlay = _hash_payload(_compute_key_payload(overlay_args, None, None, None))
+    if key_base != key_overlay:
+        print("FAIL: overlay-only change altered compute key.")
+        ok = False
+    else:
+        print("OK: overlay-only change does not affect compute key.")
+
+    # 3) Compute parameter change should alter compute key.
+    changed_args = types.SimpleNamespace(**vars(base_args))
+    changed_args.eps = 7.0
+    key_changed = _hash_payload(_compute_key_payload(changed_args, None, None, None))
+    if key_base == key_changed:
+        print("FAIL: compute parameter change did not alter compute key.")
+        ok = False
+    else:
+        print("OK: compute parameter change alters compute key.")
+
+    return ok
+
+
 if __name__ == "__main__":
+    if "--self-check" in sys.argv:
+        raise SystemExit(0 if _run_self_checks() else 1)
     main()
