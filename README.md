@@ -81,7 +81,7 @@ python glint_pupil_annotation_review_ui.py --help
 Pre-generated annotations can be found in the Zenodo repository (see above)
 
 
-Manual template maker:
+Manual template maker -- if trying out on a different dataset, you can create your template by loading an example image from the dataset that shows all glints you need to detect and manually assigning each glint with a label: 
 
 ```bash
 python templatemaker_manual.py
