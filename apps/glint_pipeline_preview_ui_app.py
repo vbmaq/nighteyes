@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 import json
+import hashlib
+import logging
 import cv2
 import numpy as np
 import re
@@ -12,6 +14,8 @@ import tempfile
 import zipfile
 import shutil
 import time
+import sys
+from collections import OrderedDict
 
 from glint_pipeline import eval_gen as g
 from glint_pipeline.temporal import MultiGlintTracker
@@ -23,7 +27,258 @@ except ImportError as exc:
     raise SystemExit("Pillow is required. Install with: python -m pip install pillow") from exc
 
 
+_LOGGER = logging.getLogger(__name__)
+if not _LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+_OVERLAY_CACHE_MAX = 32
+
+# Whitelist of args that affect compute results (detection/scoring/matching/temporal).
+_COMPUTE_ATTRS = (
+    "matcher",
+    "template_mode",
+    "score2_mode",
+    "ml_model_path",
+    "percentile",
+    "kernel",
+    "enhance_mode",
+    "enhance_enable",
+    "median_ksize",
+    "denoise",
+    "denoise_k",
+    "clahe",
+    "clahe_clip",
+    "clahe_tiles",
+    "gamma",
+    "unsharp",
+    "unsharp_amount",
+    "unsharp_sigma",
+    "minmax",
+    "clean_k",
+    "open_iter",
+    "close_iter",
+    "eps",
+    "max_pool",
+    "min_area",
+    "max_area",
+    "min_circ",
+    "min_maxI",
+    "cand_fallback",
+    "cand_target_raw",
+    "cand_fallback_passes",
+    "cand_fallback_percentiles",
+    "cand_fallback_kernel_add",
+    "cand_merge_eps",
+    "support_M",
+    "support_tol",
+    "support_w",
+    "contrast_r_inner",
+    "contrast_r_outer1",
+    "contrast_r_outer2",
+    "dog_sigma1",
+    "dog_sigma2",
+    "ratio_tol",
+    "pivot_P",
+    "max_seeds",
+    "grow_resid_max",
+    "layout_prior",
+    "layout_lambda",
+    "layout_mode",
+    "sla_layout_prior",
+    "sla_layout_lambda",
+    "sla_layout_mode",
+    "sla_semantic_prior",
+    "sla_semantic_mode",
+    "sla_semantic_lambda",
+    "sla_semantic_hard",
+    "sla_mirror_reject",
+    "sla_top2_margin",
+    "sla_base_ratio_min",
+    "sla_side_margin",
+    "sla_scale_min",
+    "sla_scale_max",
+    "sla_g0_top2",
+    "sla_w_seed_score2",
+    "sla_w_seed_geom",
+    "max_seeds_per_pivot",
+    "sla_adaptive_ratio_tol",
+    "sla_ratio_tol_min",
+    "sla_ratio_tol_refN",
+    "temporal",
+    "temporal_prior",
+    "temporal_gate_px",
+    "temporal_max_missed",
+    "temporal_lambda",
+    "temporal_w_scale",
+    "temporal_w_rot",
+    "temporal_w_trans",
+    "temporal_use_tracks_for_matching",
+    "temporal_roi_radius",
+    "vote_M",
+    "vote_ratio_tol",
+    "vote_max_hyp",
+    "vote_w_score2",
+    "min_k",
+    "iters",
+    "seed",
+    "scale_min",
+    "scale_max",
+    "disable_scale_gate",
+    "matching",
+    "appearance_tiebreak",
+    "roi_mode",
+    "roi_border_frac",
+    "roi_border_px",
+    "pupil_roi",
+    "pupil_roi_size",
+    "pupil_roi_pad_mode",
+    "pupil_roi_pad_value",
+    "pupil_roi_fail_policy",
+    "pupil_source",
+    "pupil_axis_mode",
+    "pupil_dark_thresh",
+    "pupil_min_area",
+    "pupil_rmin",
+    "pupil_rmax",
+    "pupil_fallback_center",
+    "pupil_method",
+    "pupil_radii",
+    "pupil_sigma_frac",
+    "pupil_fail_open",
+    "pupil_force_gate",
+    "pupil_npz",
+    "auto_scale",
+    "ref_width",
+    "min_kernel",
+    "min_inliers",
+    "template_bank_source",
+    "template_bank_path",
+    "bank_select_metric",
+    "template_build_mode",
+    "mirror",
+)
+
+
+def _stable_json_dumps(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _hash_payload(payload: dict) -> str:
+    blob = _stable_json_dumps(payload)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _file_fingerprint(path: str | None) -> dict | None:
+    if not path:
+        return None
+    p = Path(path)
+    try:
+        stat = p.stat()
+        return {"path": str(p.resolve()), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+    except Exception:
+        return {"path": str(p)}
+
+
+def _default_template_path() -> str:
+    try:
+        return str(Path(__file__).resolve().parents[1] / "templates" / "default_templates.json")
+    except Exception:
+        return "templates/default_templates.json"
+
+
+def _compute_key_payload(args, templates_path: str | None, image_config_path: str | None, pupil_npz_path: str | None) -> dict:
+    payload = {}
+    for key in _COMPUTE_ATTRS:
+        payload[key] = getattr(args, key, None)
+    if getattr(args, "template_bank_source", None) == "custom":
+        payload["template_bank_file"] = _file_fingerprint(getattr(args, "template_bank_path", None) or templates_path)
+    else:
+        payload["template_bank_file"] = _file_fingerprint(_default_template_path())
+    payload["image_config_file"] = _file_fingerprint(image_config_path or getattr(args, "image_config", None))
+    payload["pupil_npz_file"] = _file_fingerprint(pupil_npz_path or getattr(args, "pupil_npz", None))
+    return payload
+
+
+def _overlay_key_payload(args, overrides_key, corr_mode: bool) -> dict:
+    return {
+        "show_overlay": bool(getattr(args, "show_overlay", True)),
+        "preview_enhanced": bool(getattr(args, "preview_enhanced", False)),
+        "pupil_roi_debug": bool(getattr(args, "pupil_roi_debug", False)),
+        "match_tol": float(getattr(args, "match_tol", 0.0)),
+        "corr_mode": bool(corr_mode),
+        "overrides": overrides_key,
+    }
+
+
 _MP_SAVE_STATE = {}
+
+
+class _Tooltip:
+    def __init__(self, root: tk.Tk, delay_ms: int = 500, wraplength: int = 440) -> None:
+        self.root = root
+        self.delay_ms = int(delay_ms)
+        self.wraplength = int(wraplength)
+        self._after_id = None
+        self._tipwin = None
+        self._text = ""
+        self._x = 0
+        self._y = 0
+
+    def bind(self, widget, text: str) -> None:
+        if not text:
+            return
+        widget.bind("<Enter>", lambda e, w=widget, t=text: self._schedule(w, t, e), add="+")
+        widget.bind("<Leave>", lambda _e: self.hide(), add="+")
+        widget.bind("<ButtonPress>", lambda _e: self.hide(), add="+")
+
+    def _schedule(self, _widget, text: str, event) -> None:
+        self._text = text
+        self._x = int(getattr(event, "x_root", 0)) + 16
+        self._y = int(getattr(event, "y_root", 0)) + 12
+        self._cancel()
+        self._after_id = self.root.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+
+    def hide(self) -> None:
+        self._cancel()
+        if self._tipwin is None:
+            return
+        try:
+            self._tipwin.destroy()
+        except Exception:
+            pass
+        self._tipwin = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._tipwin is not None or not self._text:
+            return
+        try:
+            tw = tk.Toplevel(self.root)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{self._x}+{self._y}")
+            label = tk.Label(
+                tw,
+                text=self._text,
+                justify=tk.LEFT,
+                background="#ffffe0",
+                relief=tk.SOLID,
+                borderwidth=1,
+                wraplength=self.wraplength,
+                font=("Segoe UI", 9),
+            )
+            label.pack(ipadx=6, ipady=4)
+            self._tipwin = tw
+        except Exception:
+            self._tipwin = None
 
 
 def _mp_save_init(
@@ -336,8 +591,11 @@ class PreviewApp:
         self.last_idx = None
         self.last_good_pupil = None
         self.bulk_processing = False
-        self.frame_cache = {}
-        self.cache_key = None
+        # Two-level caching: compute results per frame+compute_key, overlay LRU for renders.
+        self.compute_cache = {}
+        self.overlay_cache = OrderedDict()
+        self.overlay_cache_max = _OVERLAY_CACHE_MAX
+        self.compute_key = None
         self.cache_lock = threading.Lock()
         self.cache_thread = None
         self.cache_token = 0
@@ -349,6 +607,7 @@ class PreviewApp:
         self.current_preview_base = None
         self.current_preview_base_name = None
         self.current_preview_base_cache_key = None
+        self.overlay_text_var = tk.StringVar(value="")
         self.args_dirty = True
         self.args_cached = None
         self.args_cached_key = None
@@ -436,26 +695,253 @@ class PreviewApp:
 
         ctrl_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
+        tooltip = _Tooltip(self.root)
+        field_help = {
+            "preview_enhanced": "If enabled, the background preview image uses the enhanced version of the frame.\nThis affects only how the preview looks (not the candidate/match computation).",
+            "show_overlay": "Draw the detected candidates and matched glints on the image.\nDisable to show the plain grayscale preview (faster).",
+            "matcher": "Matching algorithm.\n- ransac: RANSAC-based constellation fit\n- star: star-tracker style voting\n- hybrid: combines ransac + star\n- sla: structured layout-aware matcher",
+            "template_mode": "Template source.\n- single: use one template\n- bank: choose best template from a bank",
+            "matching": "Final assignment step for matching template points to candidates.\n- greedy: fast heuristic assignment\n- hungarian: optimal assignment (slower)",
+            "match_tol": "Pixel tolerance used for visualization (and GT metrics in eval script) when judging a match as correct.",
+            "min_inliers": "Minimum number of matched points required to accept a hypothesis.",
+            "appearance_tiebreak": "When enabled, uses candidate score2 as an additional tiebreaker between hypotheses.",
+            "eps": "Inlier threshold (pixels) used by matchers to consider a candidate consistent with the hypothesis.",
+            "max_pool": "Maximum number of candidates (highest score2) passed into matching.",
+            "layout_prior": "Enable a soft prior that prefers physically plausible glint layouts.",
+            "layout_lambda": "Strength of the layout prior penalty (higher = stronger).",
+            "seed": "Random seed used by matchers that sample hypotheses (e.g., RANSAC).",
+            "scale_min": "Minimum allowed scale for similarity transform hypotheses.",
+            "scale_max": "Maximum allowed scale for similarity transform hypotheses.",
+            "disable_scale_gate": "Disable the scale_min/scale_max gating (allows any scale).",
+            "min_k": "Number of points used per RANSAC hypothesis (typically 3).",
+            "iters": "Number of RANSAC iterations (more = slower but can be more robust).",
+            "vote_M": "Star matcher: shortlist size per template point (higher = more hypotheses).",
+            "vote_ratio_tol": "Star matcher: tolerance on log-scale ratio (gating of hypothesized scales).",
+            "vote_max_hyp": "Star matcher: maximum number of hypotheses to verify.",
+            "vote_w_score2": "Star matcher: weight of score2 in vote ranking (0 = geometry-only).",
+            "thr_pct": "Percentile threshold for candidate mask (higher = fewer candidates).",
+            "kernel": "Top-hat kernel size (odd). Larger finds broader bright spots but can merge structures.",
+            "min_area": "Minimum connected-component area (pixels) to keep a candidate blob.",
+            "max_area": "Maximum connected-component area (pixels) to keep a candidate blob.",
+            "min_circ": "Minimum circularity (0..1) for candidate blobs (higher = more circular).",
+            "cand_fallback": "If enabled, runs additional candidate passes if too few raw candidates are found.",
+            "cand_target_raw": "Target raw candidate count before fallback stops (used with cand_fallback).",
+            "cand_fallback_passes": "Maximum number of fallback passes (used with cand_fallback).",
+            "cand_fallback_percentiles": "Comma-separated percentiles to try for fallback passes (e.g. 99.5,99,98.5,98).",
+            "score2_mode": "How candidates are scored/ranked before matching.\n- heuristic: simple score\n- contrast: contrast-based\n- contrast_support: contrast + neighborhood support\n- ml_cc: ML model over candidate connected components",
+            "ml_model_path": "Path to the ML model file.\nOnly used when score2_mode = ml_cc.",
+            "support_M": "Support scoring: number of neighbors to consider.\nOnly used when score2_mode = contrast_support.",
+            "support_tol": "Support scoring: tolerance parameter.\nOnly used when score2_mode = contrast_support.",
+            "support_w": "Support scoring: weight of support term.\nOnly used when score2_mode = contrast_support.",
+            "contrast_r_inner": "Contrast scoring: inner radius (pixels).\nUsed when score2_mode is contrast/contrast_support.",
+            "contrast_r_outer1": "Contrast scoring: outer radius 1 (pixels).\nUsed when score2_mode is contrast/contrast_support.",
+            "contrast_r_outer2": "Contrast scoring: outer radius 2 (pixels).\nUsed when score2_mode is contrast/contrast_support.",
+            "enhance_mode": "Enhancement mode applied before candidate detection (when enhance_enable is on).",
+            "enhance_enable": "Enable/disable enhancement pipeline (tophat/dog/highpass).",
+            "median_ksize": "Median blur kernel size (odd).",
+            "denoise": "Enable denoising as part of enhancement (median blur).",
+            "denoise_k": "Override median blur kernel size (0 uses median_ksize). Only used when denoise is enabled.",
+            "clahe": "Enable CLAHE (contrast-limited adaptive histogram equalization).",
+            "clahe_clip": "CLAHE clip limit. Only used when CLAHE is enabled.",
+            "clahe_tiles": "CLAHE tile grid size. Only used when CLAHE is enabled.",
+            "gamma_enable": "Enable gamma correction.",
+            "gamma": "Gamma correction (>1 darkens, <1 brightens). Only used when gamma_enable is enabled.",
+            "unsharp": "Enable unsharp mask sharpening.",
+            "unsharp_amount": "Unsharp strength. Only used when unsharp is enabled.",
+            "unsharp_sigma": "Unsharp blur sigma. Only used when unsharp is enabled.",
+            "minmax": "Enable min-max normalization during enhancement.",
+            "clean_k": "Morphology cleanup kernel size for candidate mask.",
+            "open_iter": "Morphology open iterations for cleanup.",
+            "close_iter": "Morphology close iterations for cleanup.",
+            "dog_sigma1": "DoG enhancement: sigma1. Only used when enhance_mode = dog.",
+            "dog_sigma2": "DoG enhancement: sigma2. Only used when enhance_mode = dog.",
+            "pupil_roi": "Enable pupil-centered ROI cropping for candidate detection (reduces search area).",
+            "pupil_roi_size": "ROI size (pixels). Only used when pupil_roi is enabled.",
+            "pupil_roi_pad_mode": "Padding mode if ROI goes out of bounds. Only used when pupil_roi is enabled.",
+            "pupil_roi_pad_value": "Constant padding value (0..255). Only used when pupil_roi_pad_mode = constant.",
+            "pupil_roi_fail_policy": "What to do if pupil center is unavailable.\n- skip: skip frame\n- full_frame: fall back to full image\n- last_good: reuse last good pupil center",
+            "pupil_roi_debug": "Draw the ROI rectangle on the preview (debug).",
+            "pupil_source": "Where pupil center comes from (auto/labels/naive/swirski/npz/none).",
+            "pupil_axis_mode": "Pupil axis mode for interpreting pupil size inputs (auto/radius/diameter).",
+            "pivot_P": "SLA matcher: consider top-P pivot candidates by score2.",
+            "ratio_tol": "SLA matcher: log-ratio tolerance for geometric consistency.",
+            "max_seeds": "SLA matcher: maximum seed hypotheses to try.",
+            "grow_resid_max": "SLA matcher: max median residual when growing. Leave blank to use eps.",
+            "sla_layout_prior": "SLA-only: enable layout prior inside SLA.",
+            "sla_layout_lambda": "SLA-only: strength of SLA layout prior penalty.",
+            "sla_semantic_prior": "SLA-only: enable semantic geometry prior.",
+            "sla_semantic_mode": "SLA-only: which semantic rules apply (full vs top_only).",
+            "sla_semantic_lambda": "SLA-only: semantic penalty weight.",
+            "temporal": "Enable temporal tracking/smoothing across frames.",
+            "temporal_gate_px": "Temporal tracking: gating radius in pixels.",
+            "temporal_max_missed": "Temporal tracking: max consecutive missed frames before a track is dropped.",
+            "temporal_lambda": "Temporal tracking: smoothing strength (higher = smoother but less responsive).",
+            "temporal_w_scale": "Temporal tracking: weight on scale changes.",
+            "temporal_w_rot": "Temporal tracking: weight on rotation changes.",
+            "temporal_w_trans": "Temporal tracking: weight on translation changes.",
+        }
+
         self.vars = {}
-        def add_field(label, key, default, field_type="entry", values=None):
-            row = ttk.Frame(ctrl)
+        self.field_rows = {}
+        self.field_pack_opts = {}
+        self.field_parent = {}
+        self.field_order_by_parent = {}
+        self.group_frames = {}
+        self.group_pack_opts = {}
+        self.group_order = []
+
+        def _register_group(key: str, frame, pack_opts: dict) -> None:
+            self.group_frames[key] = frame
+            self.group_pack_opts[key] = pack_opts
+            self.group_order.append(key)
+
+        def _set_group_visible(key: str, visible: bool) -> None:
+            frame = self.group_frames.get(key)
+            if frame is None:
+                return
+            is_packed = frame.winfo_manager() == "pack"
+            if visible:
+                if is_packed:
+                    return
+                before_widget = None
+                try:
+                    idx = self.group_order.index(key)
+                except ValueError:
+                    idx = -1
+                if idx >= 0:
+                    for next_key in self.group_order[idx + 1 :]:
+                        next_frame = self.group_frames.get(next_key)
+                        if next_frame is not None and next_frame.winfo_manager() == "pack":
+                            before_widget = next_frame
+                            break
+                if before_widget is not None:
+                    frame.pack(before=before_widget, **self.group_pack_opts.get(key, {"fill": tk.X}))
+                else:
+                    frame.pack(**self.group_pack_opts.get(key, {"fill": tk.X}))
+            else:
+                if not is_packed:
+                    return
+                frame.pack_forget()
+
+        def _register_field_row(key: str, row: ttk.Frame, parent):
+            self.field_rows[key] = row
+            self.field_parent[key] = parent
+            self.field_pack_opts[key] = {"fill": tk.X, "pady": 2}
+            self.field_order_by_parent.setdefault(parent, []).append(key)
+
+        def _set_field_visible(key: str, visible: bool) -> None:
+            row = self.field_rows.get(key)
+            if row is None:
+                return
+            is_packed = row.winfo_manager() == "pack"
+            if visible:
+                if is_packed:
+                    return
+                parent = self.field_parent.get(key)
+                order = self.field_order_by_parent.get(parent, [])
+                before_widget = None
+                try:
+                    idx = order.index(key)
+                except ValueError:
+                    idx = -1
+                if idx >= 0:
+                    for next_key in order[idx + 1 :]:
+                        next_row = self.field_rows.get(next_key)
+                        if next_row is not None and next_row.winfo_manager() == "pack":
+                            before_widget = next_row
+                            break
+                if before_widget is not None:
+                    row.pack(before=before_widget, **self.field_pack_opts.get(key, {"fill": tk.X, "pady": 2}))
+                else:
+                    row.pack(**self.field_pack_opts.get(key, {"fill": tk.X, "pady": 2}))
+            else:
+                if not is_packed:
+                    return
+                row.pack_forget()
+
+        def _update_dependent_visibility(_evt=None) -> None:
+            score2_mode = self.vars.get("score2_mode").get() if "score2_mode" in self.vars else ""
+            enhance_mode = self.vars.get("enhance_mode").get() if "enhance_mode" in self.vars else ""
+            denoise = bool(self.vars.get("denoise").get()) if "denoise" in self.vars else False
+            clahe = bool(self.vars.get("clahe").get()) if "clahe" in self.vars else False
+            gamma_enable = bool(self.vars.get("gamma_enable").get()) if "gamma_enable" in self.vars else False
+            unsharp = bool(self.vars.get("unsharp").get()) if "unsharp" in self.vars else False
+            cand_fallback = bool(self.vars.get("cand_fallback").get()) if "cand_fallback" in self.vars else False
+            pupil_roi = bool(self.vars.get("pupil_roi").get()) if "pupil_roi" in self.vars else False
+            pad_mode = self.vars.get("pupil_roi_pad_mode").get() if "pupil_roi_pad_mode" in self.vars else ""
+            matcher = self.vars.get("matcher").get() if "matcher" in self.vars else ""
+            temporal = bool(self.vars.get("temporal").get()) if "temporal" in self.vars else False
+
+            _set_field_visible("ml_model_path", score2_mode == "ml_cc")
+            for k in ("contrast_r_inner", "contrast_r_outer1", "contrast_r_outer2"):
+                _set_field_visible(k, score2_mode in ("contrast", "contrast_support"))
+            for k in ("support_M", "support_tol", "support_w"):
+                _set_field_visible(k, score2_mode == "contrast_support")
+
+            _set_field_visible("denoise_k", denoise)
+            for k in ("clahe_clip", "clahe_tiles"):
+                _set_field_visible(k, clahe)
+            _set_field_visible("gamma", gamma_enable)
+            for k in ("unsharp_amount", "unsharp_sigma"):
+                _set_field_visible(k, unsharp)
+            for k in ("dog_sigma1", "dog_sigma2"):
+                _set_field_visible(k, enhance_mode == "dog")
+
+            for k in ("cand_target_raw", "cand_fallback_passes", "cand_fallback_percentiles"):
+                _set_field_visible(k, cand_fallback)
+
+            for k in (
+                "pupil_roi_size",
+                "pupil_roi_pad_mode",
+                "pupil_roi_pad_value",
+                "pupil_roi_fail_policy",
+                "pupil_roi_debug",
+                "pupil_source",
+                "pupil_axis_mode",
+            ):
+                _set_field_visible(k, pupil_roi)
+            _set_field_visible("pupil_roi_pad_value", pupil_roi and pad_mode == "constant")
+
+            _set_field_visible("min_inliers", matcher in ("star", "sla", "hybrid"))
+            _set_group_visible("scale", matcher in ("ransac", "star", "hybrid"))
+            _set_group_visible("ransac", matcher in ("ransac", "hybrid"))
+            _set_group_visible("star", matcher in ("star", "hybrid"))
+
+            for k in ("sla_layout_prior", "sla_layout_lambda", "sla_semantic_prior", "sla_semantic_mode", "sla_semantic_lambda"):
+                _set_field_visible(k, matcher == "sla")
+            _set_group_visible("sla", matcher == "sla")
+
+            for k in ("temporal_gate_px", "temporal_max_missed", "temporal_lambda", "temporal_w_scale", "temporal_w_rot", "temporal_w_trans"):
+                _set_field_visible(k, temporal)
+
+        def add_field(label, key, default, field_type="entry", values=None, parent=None):
+            parent = ctrl if parent is None else parent
+            row = ttk.Frame(parent)
             row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=label, width=20).pack(side=tk.LEFT)
+            _register_field_row(key, row, parent)
+            lbl = ttk.Label(row, text=label, width=20)
+            lbl.pack(side=tk.LEFT)
+            tip = field_help.get(key, "")
+            tooltip.bind(lbl, tip)
+            tooltip.bind(row, tip)
             if field_type == "combobox":
                 var = tk.StringVar(value=str(default))
                 cb = ttk.Combobox(row, textvariable=var, values=values, width=14, state="readonly")
                 cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 self.vars[key] = var
+                tooltip.bind(cb, tip)
             elif field_type == "check":
                 var = tk.BooleanVar(value=bool(default))
                 chk = ttk.Checkbutton(row, variable=var)
                 chk.pack(side=tk.LEFT)
                 self.vars[key] = var
+                tooltip.bind(chk, tip)
             else:
                 var = tk.StringVar(value=str(default))
                 ent = ttk.Entry(row, textvariable=var, width=16)
                 ent.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 self.vars[key] = var
+                tooltip.bind(ent, tip)
 
         # Template/image config load
         cfg_row = ttk.Frame(ctrl)
@@ -475,82 +961,169 @@ class PreviewApp:
         self.corr_rotate = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctrl, text="Correction mode", variable=self.corr_mode, command=self._toggle_correction).pack(anchor=tk.W, pady=(2, 6))
 
-        add_field("matcher", "matcher", "hybrid", "combobox", ["ransac", "star", "hybrid", "sla"])
-        add_field("template_mode", "template_mode", "bank", "combobox", ["single", "bank"])
-        add_field("score2_mode", "score2_mode", "contrast_support", "combobox", ["heuristic", "contrast", "contrast_support", "ml_cc"])
-        add_field("ml_model_path", "ml_model_path", "")
-        add_field("thr_pct", "percentile", 99.7)
-        add_field("kernel", "kernel", 11)
-        add_field("enhance_mode", "enhance_mode", "tophat", "combobox", ["tophat", "dog", "highpass"])
-        add_field("enhance_enable", "enhance_enable", True, "check")
-        add_field("median_ksize", "median_ksize", 3)
-        add_field("denoise", "denoise", True, "check")
-        add_field("denoise_k", "denoise_k", 0)
-        add_field("clahe", "clahe", True, "check")
-        add_field("clahe_clip", "clahe_clip", 2.0)
-        add_field("clahe_tiles", "clahe_tiles", 8)
-        add_field("gamma_enable", "gamma_enable", True, "check")
-        add_field("gamma", "gamma", 11.0)
-        add_field("unsharp", "unsharp", False, "check")
-        add_field("unsharp_amount", "unsharp_amount", 1.0)
-        add_field("unsharp_sigma", "unsharp_sigma", 1.0)
-        add_field("minmax", "minmax", True, "check")
-        add_field("preview_enhanced", "preview_enhanced", False, "check")
-        add_field("show_overlay", "show_overlay", True, "check")
-        add_field("clean_k", "clean_k", 3)
-        add_field("open_iter", "open_iter", 1)
-        add_field("close_iter", "close_iter", 0)
-        add_field("eps", "eps", 6.0)
-        add_field("max_pool", "max_pool", 30)
-        add_field("min_area", "min_area", 8)
-        add_field("max_area", "max_area", 250)
-        add_field("min_circ", "min_circ", 0.45)
-        add_field("pupil_roi", "pupil_roi", False, "check")
-        add_field("pupil_roi_size", "pupil_roi_size", 80)
-        add_field("pupil_roi_pad_mode", "pupil_roi_pad_mode", "reflect", "combobox", ["reflect", "constant", "edge"])
-        add_field("pupil_roi_pad_value", "pupil_roi_pad_value", 0)
-        add_field("pupil_roi_fail_policy", "pupil_roi_fail_policy", "skip", "combobox", ["skip", "full_frame", "last_good"])
-        add_field("pupil_roi_debug", "pupil_roi_debug", False, "check")
-        add_field("pupil_source", "pupil_source", "none", "combobox", ["auto", "labels", "naive", "swirski", "npz", "none"])
-        add_field("pupil_axis_mode", "pupil_axis_mode", "auto", "combobox", ["auto", "radius", "diameter"])
-        add_field("cand_fallback", "cand_fallback", True, "check")
-        add_field("cand_target_raw", "cand_target_raw", 12)
-        add_field("cand_fallback_passes", "cand_fallback_passes", 4)
-        add_field("cand_fallback_percentiles", "cand_fallback_percentiles", "99.5,99,98.5,98")
-        add_field("support_M", "support_M", 30)
-        add_field("support_tol", "support_tol", 0.10)
-        add_field("support_w", "support_w", 0.15)
-        add_field("contrast_r_inner", "contrast_r_inner", 3)
-        add_field("contrast_r_outer1", "contrast_r_outer1", 5)
-        add_field("contrast_r_outer2", "contrast_r_outer2", 8)
-        add_field("dog_sigma1", "dog_sigma1", 1.0)
-        add_field("dog_sigma2", "dog_sigma2", 2.2)
-        add_field("ratio_tol", "ratio_tol", 0.12)
-        add_field("pivot_P", "pivot_P", 8)
-        add_field("max_seeds", "max_seeds", 200)
-        add_field("layout_prior", "layout_prior", False, "check")
-        add_field("layout_lambda", "layout_lambda", 0.25)
-        add_field("sla_layout_prior", "sla_layout_prior", False, "check")
-        add_field("sla_layout_lambda", "sla_layout_lambda", 0.25)
-        add_field("sla_semantic_prior", "sla_semantic_prior", False, "check")
-        add_field("sla_semantic_mode", "sla_semantic_mode", "full", "combobox", ["full", "top_only"])
-        add_field("sla_semantic_lambda", "sla_semantic_lambda", 1.5)
-        add_field("temporal", "temporal", False, "check")
-        add_field("temporal_gate_px", "temporal_gate_px", 25.0)
-        add_field("temporal_max_missed", "temporal_max_missed", 5)
-        add_field("temporal_lambda", "temporal_lambda", 0.25)
-        add_field("temporal_w_scale", "temporal_w_scale", 1.0)
-        add_field("temporal_w_rot", "temporal_w_rot", 1.0)
-        add_field("temporal_w_trans", "temporal_w_trans", 1.0)
+        grp_display = ttk.LabelFrame(ctrl, text="Display", padding=6)
+        grp_display.pack(fill=tk.X, pady=(0, 8))
+        _register_group("display", grp_display, {"fill": tk.X, "pady": (0, 8)})
+        add_field("preview_enhanced", "preview_enhanced", False, "check", parent=grp_display)
+        add_field("show_overlay", "show_overlay", True, "check", parent=grp_display)
 
-        # Preview panel
-        self.canvas = tk.Canvas(paned, bg="#111", width=900, height=700, highlightthickness=1, highlightbackground="#444")
+        grp_enhance = ttk.LabelFrame(ctrl, text="Enhancement / Cleanup", padding=6)
+        grp_enhance.pack(fill=tk.X, pady=(0, 8))
+        _register_group("enhance", grp_enhance, {"fill": tk.X, "pady": (0, 8)})
+        add_field("enhance_mode", "enhance_mode", "tophat", "combobox", ["tophat", "dog", "highpass"], parent=grp_enhance)
+        add_field("enhance_enable", "enhance_enable", True, "check", parent=grp_enhance)
+        add_field("median_ksize", "median_ksize", 3, parent=grp_enhance)
+        add_field("denoise", "denoise", True, "check", parent=grp_enhance)
+        add_field("denoise_k", "denoise_k", 0, parent=grp_enhance)
+        add_field("clahe", "clahe", True, "check", parent=grp_enhance)
+        add_field("clahe_clip", "clahe_clip", 2.0, parent=grp_enhance)
+        add_field("clahe_tiles", "clahe_tiles", 8, parent=grp_enhance)
+        add_field("gamma_enable", "gamma_enable", True, "check", parent=grp_enhance)
+        add_field("gamma", "gamma", 11.0, parent=grp_enhance)
+        add_field("unsharp", "unsharp", False, "check", parent=grp_enhance)
+        add_field("unsharp_amount", "unsharp_amount", 1.0, parent=grp_enhance)
+        add_field("unsharp_sigma", "unsharp_sigma", 1.0, parent=grp_enhance)
+        add_field("minmax", "minmax", True, "check", parent=grp_enhance)
+        add_field("clean_k", "clean_k", 3, parent=grp_enhance)
+        add_field("open_iter", "open_iter", 1, parent=grp_enhance)
+        add_field("close_iter", "close_iter", 0, parent=grp_enhance)
+        add_field("dog_sigma1", "dog_sigma1", 1.0, parent=grp_enhance)
+        add_field("dog_sigma2", "dog_sigma2", 2.2, parent=grp_enhance)
+
+        grp_scoring = ttk.LabelFrame(ctrl, text="Scoring (contrast / support / ML)", padding=6)
+        grp_scoring.pack(fill=tk.X, pady=(0, 8))
+        _register_group("scoring", grp_scoring, {"fill": tk.X, "pady": (0, 8)})
+        add_field(
+            "score2_mode",
+            "score2_mode",
+            "contrast_support",
+            "combobox",
+            ["heuristic", "contrast", "contrast_support", "ml_cc"],
+            parent=grp_scoring,
+        )
+        add_field("ml_model_path", "ml_model_path", "", parent=grp_scoring)
+        add_field("support_M", "support_M", 30, parent=grp_scoring)
+        add_field("support_tol", "support_tol", 0.10, parent=grp_scoring)
+        add_field("support_w", "support_w", 0.15, parent=grp_scoring)
+        add_field("contrast_r_inner", "contrast_r_inner", 3, parent=grp_scoring)
+        add_field("contrast_r_outer1", "contrast_r_outer1", 5, parent=grp_scoring)
+        add_field("contrast_r_outer2", "contrast_r_outer2", 8, parent=grp_scoring)
+
+        grp_candidates = ttk.LabelFrame(ctrl, text="Candidates / Thresholding", padding=6)
+        grp_candidates.pack(fill=tk.X, pady=(0, 8))
+        _register_group("candidates", grp_candidates, {"fill": tk.X, "pady": (0, 8)})
+        add_field("thr_pct", "percentile", 99.7, parent=grp_candidates)
+        add_field("kernel", "kernel", 11, parent=grp_candidates)
+        add_field("min_area", "min_area", 8, parent=grp_candidates)
+        add_field("max_area", "max_area", 250, parent=grp_candidates)
+        add_field("min_circ", "min_circ", 0.45, parent=grp_candidates)
+        add_field("cand_fallback", "cand_fallback", True, "check", parent=grp_candidates)
+        add_field("cand_target_raw", "cand_target_raw", 12, parent=grp_candidates)
+        add_field("cand_fallback_passes", "cand_fallback_passes", 4, parent=grp_candidates)
+        add_field("cand_fallback_percentiles", "cand_fallback_percentiles", "99.5,99,98.5,98", parent=grp_candidates)
+
+        grp_matching = ttk.LabelFrame(ctrl, text="Matching", padding=6)
+        grp_matching.pack(fill=tk.X, pady=(0, 8))
+        _register_group("matching", grp_matching, {"fill": tk.X, "pady": (0, 8)})
+        add_field("matcher", "matcher", "hybrid", "combobox", ["ransac", "star", "hybrid", "sla"], parent=grp_matching)
+        add_field("template_mode", "template_mode", "bank", "combobox", ["single", "bank"], parent=grp_matching)
+        add_field("matching", "matching", "greedy", "combobox", ["greedy", "hungarian"], parent=grp_matching)
+        add_field("match_tol", "match_tol", 10.0, parent=grp_matching)
+        add_field("min_inliers", "min_inliers", 3, parent=grp_matching)
+        add_field("appearance_tiebreak", "appearance_tiebreak", False, "check", parent=grp_matching)
+        add_field("eps", "eps", 6.0, parent=grp_matching)
+        add_field("max_pool", "max_pool", 30, parent=grp_matching)
+        add_field("layout_prior", "layout_prior", False, "check", parent=grp_matching)
+        add_field("layout_lambda", "layout_lambda", 0.25, parent=grp_matching)
+
+        grp_scale = ttk.LabelFrame(ctrl, text="Scale / Gating", padding=6)
+        grp_scale.pack(fill=tk.X, pady=(0, 8))
+        _register_group("scale", grp_scale, {"fill": tk.X, "pady": (0, 8)})
+        add_field("seed", "seed", 0, parent=grp_scale)
+        add_field("scale_min", "scale_min", 0.6, parent=grp_scale)
+        add_field("scale_max", "scale_max", 1.6, parent=grp_scale)
+        add_field("disable_scale_gate", "disable_scale_gate", False, "check", parent=grp_scale)
+
+        grp_ransac = ttk.LabelFrame(ctrl, text="RANSAC", padding=6)
+        grp_ransac.pack(fill=tk.X, pady=(0, 8))
+        _register_group("ransac", grp_ransac, {"fill": tk.X, "pady": (0, 8)})
+        add_field("min_k", "min_k", 3, parent=grp_ransac)
+        add_field("iters", "iters", 4000, parent=grp_ransac)
+
+        grp_star = ttk.LabelFrame(ctrl, text="Star", padding=6)
+        grp_star.pack(fill=tk.X, pady=(0, 8))
+        _register_group("star", grp_star, {"fill": tk.X, "pady": (0, 8)})
+        add_field("vote_M", "vote_M", 8, parent=grp_star)
+        add_field("vote_ratio_tol", "vote_ratio_tol", 0.12, parent=grp_star)
+        add_field("vote_max_hyp", "vote_max_hyp", 2000, parent=grp_star)
+        add_field("vote_w_score2", "vote_w_score2", 0.0, parent=grp_star)
+
+        grp_sla = ttk.LabelFrame(ctrl, text="SLA", padding=6)
+        grp_sla.pack(fill=tk.X, pady=(0, 8))
+        _register_group("sla", grp_sla, {"fill": tk.X, "pady": (0, 8)})
+        add_field("pivot_P", "pivot_P", 8, parent=grp_sla)
+        add_field("ratio_tol", "ratio_tol", 0.12, parent=grp_sla)
+        add_field("max_seeds", "max_seeds", 200, parent=grp_sla)
+        add_field("grow_resid_max", "grow_resid_max", "", parent=grp_sla)
+        add_field("sla_layout_prior", "sla_layout_prior", False, "check", parent=grp_sla)
+        add_field("sla_layout_lambda", "sla_layout_lambda", 0.25, parent=grp_sla)
+        add_field("sla_semantic_prior", "sla_semantic_prior", False, "check", parent=grp_sla)
+        add_field("sla_semantic_mode", "sla_semantic_mode", "full", "combobox", ["full", "top_only"], parent=grp_sla)
+        add_field("sla_semantic_lambda", "sla_semantic_lambda", 1.5, parent=grp_sla)
+
+        grp_pupil = ttk.LabelFrame(ctrl, text="Pupil ROI", padding=6)
+        grp_pupil.pack(fill=tk.X, pady=(0, 8))
+        _register_group("pupil", grp_pupil, {"fill": tk.X, "pady": (0, 8)})
+        add_field("pupil_roi", "pupil_roi", False, "check", parent=grp_pupil)
+        add_field("pupil_roi_size", "pupil_roi_size", 80, parent=grp_pupil)
+        add_field("pupil_roi_pad_mode", "pupil_roi_pad_mode", "reflect", "combobox", ["reflect", "constant", "edge"], parent=grp_pupil)
+        add_field("pupil_roi_pad_value", "pupil_roi_pad_value", 0, parent=grp_pupil)
+        add_field("pupil_roi_fail_policy", "pupil_roi_fail_policy", "skip", "combobox", ["skip", "full_frame", "last_good"], parent=grp_pupil)
+        add_field("pupil_roi_debug", "pupil_roi_debug", False, "check", parent=grp_pupil)
+        add_field(
+            "pupil_source",
+            "pupil_source",
+            "none",
+            "combobox",
+            ["auto", "labels", "naive", "swirski", "npz", "none"],
+            parent=grp_pupil,
+        )
+        add_field("pupil_axis_mode", "pupil_axis_mode", "auto", "combobox", ["auto", "radius", "diameter"], parent=grp_pupil)
+
+        grp_temporal = ttk.LabelFrame(ctrl, text="Temporal", padding=6)
+        grp_temporal.pack(fill=tk.X, pady=(0, 8))
+        _register_group("temporal", grp_temporal, {"fill": tk.X, "pady": (0, 8)})
+        add_field("temporal", "temporal", False, "check", parent=grp_temporal)
+        add_field("temporal_gate_px", "temporal_gate_px", 25.0, parent=grp_temporal)
+        add_field("temporal_max_missed", "temporal_max_missed", 5, parent=grp_temporal)
+        add_field("temporal_lambda", "temporal_lambda", 0.25, parent=grp_temporal)
+        add_field("temporal_w_scale", "temporal_w_scale", 1.0, parent=grp_temporal)
+        add_field("temporal_w_rot", "temporal_w_rot", 1.0, parent=grp_temporal)
+        add_field("temporal_w_trans", "temporal_w_trans", 1.0, parent=grp_temporal)
+
+        # Preview panel (title + canvas)
+        preview_container = ttk.Frame(paned)
+        overlay_label = tk.Label(
+            preview_container,
+            textvariable=self.overlay_text_var,
+            anchor="w",
+            justify=tk.LEFT,
+            bg="#111",
+            fg="#ddd",
+            font=("Segoe UI", 9),
+            padx=6,
+            pady=4,
+        )
+        overlay_label.pack(fill=tk.X)
+
+        self.canvas = tk.Canvas(preview_container, bg="#111", width=900, height=700, highlightthickness=1, highlightbackground="#444")
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
 
         paned.add(ctrl_container, weight=0)
-        paned.add(self.canvas, weight=1)
+        paned.add(preview_container, weight=1)
 
         # Correction panel (hidden unless enabled)
         self.corr_frame = ttk.Frame(ctrl, padding=(0, 4, 0, 0))
@@ -584,6 +1157,28 @@ class PreviewApp:
             self.mirror_var.trace_add("write", self._on_settings_change)
         except Exception:
             pass
+        # dependent field visibility
+        for k in (
+            "score2_mode",
+            "enhance_mode",
+            "denoise",
+            "clahe",
+            "gamma_enable",
+            "unsharp",
+            "cand_fallback",
+            "pupil_roi",
+            "pupil_roi_pad_mode",
+            "matcher",
+            "temporal",
+        ):
+            var = self.vars.get(k)
+            if var is None:
+                continue
+            try:
+                var.trace_add("write", lambda *_a: self.root.after_idle(_update_dependent_visibility))
+            except Exception:
+                pass
+        self.root.after_idle(_update_dependent_visibility)
 
     def _request_render(self, delay_ms: int = 0) -> None:
         if self.render_request_id is not None:
@@ -648,11 +1243,51 @@ class PreviewApp:
                     matches_disp.append((int(ti), int(new_ci), d))
         return cand_xy_disp, matches_disp
 
-    def _ensure_current_preview_base(self, fp: Path, args, cache_key: str) -> np.ndarray:
+    def _frame_id(self, fp: Path) -> str:
+        try:
+            return str(fp.resolve())
+        except Exception:
+            return str(fp)
+
+    def _preview_key(self, args, compute_key: str) -> str:
+        return f"{compute_key}|preview={int(bool(getattr(args, 'preview_enhanced', False)))}"
+
+    def _compute_key(self, args) -> str:
+        payload = _compute_key_payload(args, self.templates_path, self.image_config_path, self.pupil_npz_path)
+        return _hash_payload(payload)
+
+    def _overlay_key(self, args, frame_name: str) -> str:
+        overrides_key = self._overrides_key(frame_name)
+        payload = _overlay_key_payload(args, overrides_key, bool(self.corr_mode.get()))
+        return _hash_payload(payload)
+
+    def _get_compute_entry(self, frame_id: str, compute_key: str):
+        with self.cache_lock:
+            return self.compute_cache.get(frame_id, {}).get(compute_key)
+
+    def _set_compute_entry(self, frame_id: str, compute_key: str, entry: dict) -> None:
+        with self.cache_lock:
+            self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+
+    def _overlay_cache_get(self, key):
+        with self.cache_lock:
+            if key in self.overlay_cache:
+                self.overlay_cache.move_to_end(key)
+                return self.overlay_cache[key]
+        return None
+
+    def _overlay_cache_set(self, key, value) -> None:
+        with self.cache_lock:
+            self.overlay_cache[key] = value
+            self.overlay_cache.move_to_end(key)
+            while len(self.overlay_cache) > int(self.overlay_cache_max):
+                self.overlay_cache.popitem(last=False)
+
+    def _ensure_current_preview_base(self, fp: Path, args, preview_key: str) -> np.ndarray:
         if (
             self.current_preview_base is not None
             and self.current_preview_base_name == fp.name
-            and self.current_preview_base_cache_key == cache_key
+            and self.current_preview_base_cache_key == preview_key
         ):
             return self.current_preview_base
         bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
@@ -687,10 +1322,10 @@ class PreviewApp:
             )
         self.current_preview_base = preview_base
         self.current_preview_base_name = fp.name
-        self.current_preview_base_cache_key = cache_key
+        self.current_preview_base_cache_key = preview_key
         return preview_base
 
-    def _quick_preview_rgb(self, fp: Path, args, cache_key: str) -> np.ndarray | None:
+    def _quick_preview_rgb(self, fp: Path, args, preview_key: str) -> np.ndarray | None:
         bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
         if bgr is None:
             return None
@@ -699,11 +1334,12 @@ class PreviewApp:
         gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         self.current_preview_base = gray_full
         self.current_preview_base_name = fp.name
-        self.current_preview_base_cache_key = cache_key
+        self.current_preview_base_cache_key = preview_key
         return cv2.cvtColor(gray_full, cv2.COLOR_GRAY2RGB)
 
-    def _start_ondemand_cache_compute(self, fp: Path, frame_idx: int, args, cache_key: str) -> None:
-        key = (cache_key, fp.name)
+    def _start_ondemand_cache_compute(self, fp: Path, frame_idx: int, args, compute_key: str) -> None:
+        frame_id = self._frame_id(fp)
+        key = (compute_key, frame_id)
         with self.ondemand_lock:
             if len(self.ondemand_inflight) >= 2:
                 return
@@ -712,6 +1348,8 @@ class PreviewApp:
             self.ondemand_inflight.add(key)
 
         args_snapshot = types.SimpleNamespace(**vars(args))
+        with self.cache_lock:
+            token = self.cache_token
 
         def worker():
             try:
@@ -735,11 +1373,12 @@ class PreviewApp:
                 entry = self._compute_cache_entry(fp, frame_idx, args_snapshot, cache_state)
                 if entry is None:
                     return
-                if cache_key != self.cache_key:
-                    return
                 with self.cache_lock:
-                    # Don't clobber a fresher entry if it already exists.
-                    self.frame_cache.setdefault(fp.name, entry)
+                    if token != self.cache_token or compute_key != self.compute_key:
+                        return
+                    self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+            except Exception:
+                _LOGGER.exception("On-demand cache compute failed for %s", frame_id)
             finally:
                 with self.ondemand_lock:
                     self.ondemand_inflight.discard(key)
@@ -750,93 +1389,94 @@ class PreviewApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _render_overlay_for_entry(self, fp: Path, entry: dict, args, cache_key: str) -> None:
-        overrides_key = self._overrides_key(fp.name)
-        mode = "corr" if self.corr_mode.get() else "normal"
-        if (
-            entry.get("overlay_key") == overrides_key
-            and entry.get("overlay_mode") == mode
-            and entry.get("overlay_rgb") is not None
-        ):
-            return
+    def _render_overlay_for_entry(
+        self,
+        fp: Path,
+        frame_id: str,
+        entry: dict,
+        args,
+        compute_key: str,
+    ):
+        overlay_key = self._overlay_key(args, fp.name)
+        overlay_cache_key = (frame_id, compute_key, overlay_key)
+        overlay_rgb = self._overlay_cache_get(overlay_cache_key)
+        overlay_hit = overlay_rgb is not None
 
-        preview_base = self._ensure_current_preview_base(fp, args, cache_key)
+        status = entry.get("status", "ok")
         cand_xy_base = entry.get("cand_xy_base")
         matches_base = entry.get("matches_base")
         T_hat = entry.get("T_hat")
         tracked_xy = entry.get("tracked_xy")
 
-        if cand_xy_base is None:
+        if status == "ok" and cand_xy_base is None:
             raise RuntimeError("Cache entry missing cand_xy_base")
 
-        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy_base, matches_base, T_hat)
+        if status == "ok":
+            cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy_base, matches_base, T_hat)
+        else:
+            cand_xy_disp = np.empty((0, 2), dtype=float)
+            matches_disp = []
 
-        title = f"{fp.name} | matcher={args.matcher} | inliers={entry.get('inliers', 0)} | err={entry.get('mean_err', float('nan')):.2f}px"
-        if args.temporal:
-            title += " | temporal"
-
-        if not args.show_overlay:
-            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-            if args.pupil_roi_debug and entry.get("roi_rect") is not None:
-                ox, oy, sz = entry["roi_rect"]
-                cv2.rectangle(
-                    overlay,
-                    (int(round(ox)), int(round(oy))),
-                    (int(round(ox + sz)), int(round(oy + sz))),
-                    (0, 200, 255),
-                    2,
+        if overlay_rgb is None:
+            preview_key = self._preview_key(args, compute_key)
+            preview_base = self._ensure_current_preview_base(fp, args, preview_key)
+            if status != "ok":
+                self.overlay_text_var.set(f"{fp.name} | SKIPPED (pupil ROI)")
+                overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
+                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            else:
+                title = (
+                    f"{fp.name} | matcher={args.matcher} | inliers={entry.get('inliers', 0)} | "
+                    f"err={entry.get('mean_err', float('nan')):.2f}px"
                 )
-            overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-            entry["overlay_rgb"] = overlay_rgb
-            entry["cand_xy"] = cand_xy_disp
-            entry["matches"] = matches_disp
-            entry["overlay_key"] = overrides_key
-            entry["overlay_mode"] = mode
-            return
+                if args.temporal:
+                    title += " | temporal"
+                self.overlay_text_var.set(title)
 
-        matches_draw = matches_disp
-        T_hat_draw = T_hat
-        use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
-        if use_temporal_display and tracked_xy is not None:
-            if np.isfinite(tracked_xy).any():
-                T_hat_draw = tracked_xy
-                T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-            matches_draw = []
+                roi_rect = entry.get("roi_rect")
+                use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
+                matches_draw = matches_disp
+                if not args.show_overlay:
+                    overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
+                else:
+                    T_hat_draw = T_hat
+                    if use_temporal_display and tracked_xy is not None:
+                        if np.isfinite(tracked_xy).any():
+                            T_hat_draw = tracked_xy
+                            T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
+                        matches_draw = []
+                    overlay = g.draw_overlay(
+                        preview_base,
+                        cand_xy_disp,
+                        T_hat_draw,
+                        matches_draw,
+                        title_text="",
+                        gt_xy=None,
+                        match_tol=args.match_tol,
+                    )
+                if args.pupil_roi_debug and roi_rect is not None:
+                    ox, oy, sz = roi_rect
+                    cv2.rectangle(
+                        overlay,
+                        (int(round(ox)), int(round(oy))),
+                        (int(round(ox + sz)), int(round(oy + sz))),
+                        (0, 200, 255),
+                        2,
+                    )
+                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            self._overlay_cache_set(overlay_cache_key, overlay_rgb)
 
-        overlay = g.draw_overlay(
-            preview_base,
-            cand_xy_disp,
-            T_hat_draw,
-            matches_draw,
-            title_text=title,
-            gt_xy=None,
-            match_tol=args.match_tol,
-        )
-        if args.pupil_roi_debug and entry.get("roi_rect") is not None:
-            ox, oy, sz = entry["roi_rect"]
-            cv2.rectangle(
-                overlay,
-                (int(round(ox)), int(round(oy))),
-                (int(round(ox + sz)), int(round(oy + sz))),
-                (0, 200, 255),
-                2,
-            )
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-        entry["overlay_rgb"] = overlay_rgb
-        entry["cand_xy"] = cand_xy_disp
-        entry["matches"] = matches_disp if self.corr_mode.get() else matches_draw
-        entry["overlay_key"] = overrides_key
-        entry["overlay_mode"] = mode
+        return overlay_rgb, matches_disp, cand_xy_disp, overlay_hit
 
-    def _get_args_and_cache_key(self):
+    def _get_args_and_compute_key(self):
         if not self.args_dirty and self.args_cached is not None and self.args_cached_key is not None:
             return self.args_cached, self.args_cached_key
         args = self._get_args()
-        cache_key = self._settings_cache_key(args)
+        compute_key = self._compute_key(args)
         self.args_cached = args
-        self.args_cached_key = cache_key
+        self.args_cached_key = compute_key
         self.args_dirty = False
-        return args, cache_key
+        return args, compute_key
 
     def _get_args(self):
         # Build a Namespace compatible with g.run_matcher_for_template and helpers
@@ -897,7 +1537,14 @@ class PreviewApp:
         args.ratio_tol = getv("ratio_tol", float)
         args.pivot_P = getv("pivot_P", int)
         args.max_seeds = getv("max_seeds", int)
-        args.grow_resid_max = None
+        grow_s = self.vars.get("grow_resid_max").get().strip() if "grow_resid_max" in self.vars else ""
+        if not grow_s:
+            args.grow_resid_max = None
+        else:
+            try:
+                args.grow_resid_max = float(grow_s)
+            except Exception:
+                args.grow_resid_max = None
         args.layout_prior = getb("layout_prior")
         args.layout_lambda = getv("layout_lambda", float)
         args.layout_mode = "image"
@@ -934,18 +1581,18 @@ class PreviewApp:
         args.temporal_w_trans = getv("temporal_w_trans", float)
         args.temporal_use_tracks_for_matching = True
         args.temporal_roi_radius = 0.0
-        args.vote_M = 8
-        args.vote_ratio_tol = 0.12
-        args.vote_max_hyp = 2000
-        args.vote_w_score2 = 0.0
-        args.min_k = 3
-        args.iters = 4000
-        args.seed = 0
-        args.scale_min = 0.6
-        args.scale_max = 1.6
-        args.disable_scale_gate = False
-        args.matching = "greedy"
-        args.appearance_tiebreak = False
+        args.vote_M = getv("vote_M", int)
+        args.vote_ratio_tol = getv("vote_ratio_tol", float)
+        args.vote_max_hyp = getv("vote_max_hyp", int)
+        args.vote_w_score2 = getv("vote_w_score2", float)
+        args.min_k = getv("min_k", int)
+        args.iters = getv("iters", int)
+        args.seed = getv("seed", int)
+        args.scale_min = getv("scale_min", float)
+        args.scale_max = getv("scale_max", float)
+        args.disable_scale_gate = getb("disable_scale_gate")
+        args.matching = self.vars.get("matching", tk.StringVar(value="greedy")).get()
+        args.appearance_tiebreak = getb("appearance_tiebreak")
         args.roi_mode = "none"
         args.roi_border_frac = 0.06
         args.roi_border_px = None
@@ -972,14 +1619,14 @@ class PreviewApp:
         args.auto_scale = True
         args.ref_width = 640
         args.min_kernel = 3
-        args.min_inliers = 3
+        args.min_inliers = getv("min_inliers", int)
         args.post_id_resolve = False
         args.template_bank_source = "default"
         args.template_bank_path = None
         args.bank_select_metric = "strict"
         args.template_build_mode = "procrustes"
         args.verbose_template = False
-        args.match_tol = 10.0
+        args.match_tol = getv("match_tol", float)
         args.mirror = bool(self.mirror_var.get())
 
         # overrides from loaded configs
@@ -998,15 +1645,9 @@ class PreviewApp:
 
         return args
 
-    def _settings_cache_key(self, args) -> str:
-        cfg = {k: getattr(args, k) for k in dir(args) if not k.startswith("_")}
-        cfg["templates_path"] = self.templates_path
-        cfg["image_config_path"] = self.image_config_path
-        cfg["pupil_npz_path"] = self.pupil_npz_path
-        return json.dumps(cfg, sort_keys=True, default=str)
-
     def _on_settings_change(self, *_args) -> None:
         self.args_dirty = True
+        self._request_render(0)
         self._schedule_cache_rebuild()
 
     def _schedule_cache_rebuild(self) -> None:
@@ -1023,14 +1664,16 @@ class PreviewApp:
         if not self.files or self.bulk_processing:
             return
         args_snapshot = self._get_args()
-        cache_key = self._settings_cache_key(args_snapshot)
-        if cache_key == self.cache_key and self.frame_cache:
-            return
-        self.cache_key = cache_key
-        self.frame_cache = {}
-        self.cache_token += 1
-        token = self.cache_token
-        self.cache_building = True
+        compute_key = self._compute_key(args_snapshot)
+        with self.cache_lock:
+            if compute_key == self.compute_key and self.compute_cache:
+                return
+            self.compute_key = compute_key
+            self.compute_cache = {}
+            self.overlay_cache.clear()
+            self.cache_token += 1
+            token = self.cache_token
+            self.cache_building = True
         self.status_var.set("Precomputing cache (0%)...")
         self.cache_progress_var.set(0.0)
         files_snapshot = list(self.files)
@@ -1061,12 +1704,20 @@ class PreviewApp:
                 }
                 total = len(files_snapshot)
                 for i, fp in enumerate(files_snapshot):
-                    if token != self.cache_token:
-                        return
-                    entry = self._compute_cache_entry(fp, i, args_snapshot, cache_state)
+                    with self.cache_lock:
+                        if token != self.cache_token or compute_key != self.compute_key:
+                            return
+                    frame_id = self._frame_id(fp)
+                    try:
+                        entry = self._compute_cache_entry(fp, i, args_snapshot, cache_state)
+                    except Exception:
+                        _LOGGER.exception("Cache compute failed for %s", frame_id)
+                        continue
                     if entry is not None:
                         with self.cache_lock:
-                            self.frame_cache[fp.name] = entry
+                            if token != self.cache_token or compute_key != self.compute_key:
+                                return
+                            self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
                     if (i + 1) % 2 == 0:
                         time.sleep(0)
                     if (i + 1) % 10 == 0 or i + 1 == total:
@@ -1076,8 +1727,10 @@ class PreviewApp:
                         ))
                         self.root.after(0, lambda p=pct: self.cache_progress_var.set(float(p)))
             finally:
+                with self.cache_lock:
+                    if token == self.cache_token:
+                        self.cache_building = False
                 if token == self.cache_token:
-                    self.cache_building = False
                     self.root.after(0, lambda: self.cache_progress_var.set(100.0))
                     self.root.after(0, self._request_render)
 
@@ -1145,7 +1798,17 @@ class PreviewApp:
                 cache_state["last_good_pupil"],
             )
             if roi_decision.action == "skip":
-                return None
+                return {
+                    "status": "skipped",
+                    "reason": "pupil_roi_skip",
+                    "cand_xy_base": np.empty((0, 2), dtype=float),
+                    "matches_base": [],
+                    "T_hat": None,
+                    "tracked_xy": None,
+                    "inliers": 0,
+                    "mean_err": float("nan"),
+                    "roi_rect": None,
+                }
             if roi_decision.action == "use" and roi_decision.center is not None:
                 roi_info = compute_pupil_roi(
                     gray_full,
@@ -1158,30 +1821,6 @@ class PreviewApp:
                 roi_active = True
                 if roi_decision.center is not None:
                     cache_state["last_good_pupil"] = (roi_decision.center[0], roi_decision.center[1], pr)
-
-        preview_base = gray_full
-        if getattr(args, "preview_enhanced", False):
-            kernel_eff = int(params["kernel_eff"])
-            median_ksize_eff = int(params["median_ksize_eff"])
-            preview_base = g.enhance_for_glints(
-                gray_full,
-                kernel_size=kernel_eff,
-                median_ksize=median_ksize_eff,
-                clahe_clip=args.clahe_clip,
-                clahe_tiles=args.clahe_tiles,
-                denoise=int(getattr(args, "denoise", 1)),
-                denoise_k=int(getattr(args, "denoise_k", 0)),
-                clahe_enable=int(getattr(args, "clahe", 1)),
-                gamma=float(getattr(args, "gamma", 1.0)),
-                unsharp=int(getattr(args, "unsharp", 0)),
-                unsharp_amount=float(getattr(args, "unsharp_amount", 1.0)),
-                unsharp_sigma=float(getattr(args, "unsharp_sigma", 1.0)),
-                enhance_mode=str(getattr(args, "enhance_mode", "tophat")),
-                dog_sigma1=float(getattr(args, "dog_sigma1", 1.0)),
-                dog_sigma2=float(getattr(args, "dog_sigma2", 2.2)),
-                minmax=int(getattr(args, "minmax", 1)),
-                enhance_enable=int(getattr(args, "enhance_enable", 1)),
-            )
 
         cand_xy_pass0, rows_pass0, cand_score2_pass0, cand_raw_pass0, cand_support_pass0 = g.detect_candidates_one_pass(
             gray, params, args, d_expected=cache_state["d_expected"]
@@ -1346,64 +1985,12 @@ class PreviewApp:
                 meas_labeled[:4] = T_hat[:4]
             tracked_xy, _meta = cache_state["temporal_tracker"].step_labeled(meas_labeled, frame_idx)
 
-        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
-
-        title = f"{fp.name} | matcher={args.matcher} | inliers={inliers} | err={mean_err:.2f}px"
-        if args.temporal:
-            title += " | temporal"
         roi_rect = None
         if roi_info is not None:
             roi_rect = (float(roi_info.offset_x), float(roi_info.offset_y), float(int(args.pupil_roi_size)))
 
-        if not args.show_overlay:
-            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-            if args.pupil_roi_debug and roi_rect is not None:
-                ox, oy, sz = roi_rect
-                cv2.rectangle(
-                    overlay,
-                    (int(round(ox)), int(round(oy))),
-                    (int(round(ox + sz)), int(round(oy + sz))),
-                    (0, 200, 255),
-                    2,
-                )
-            overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-            return {
-                "overlay_rgb": overlay_rgb,
-                "matches": matches_disp,
-                "cand_xy": cand_xy_disp,
-                "cand_xy_base": cand_xy,
-                "matches_base": matches,
-                "T_hat": T_hat,
-                "tracked_xy": tracked_xy,
-                "inliers": inliers,
-                "mean_err": mean_err,
-                "roi_rect": roi_rect,
-                "overlay_key": self._overrides_key(fp.name),
-                "overlay_mode": "normal",
-            }
-
-        matches_draw = matches_disp
-        T_hat_draw = T_hat
-        if args.temporal and tracked_xy is not None:
-            if np.isfinite(tracked_xy).any():
-                T_hat_draw = tracked_xy
-                T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-            matches_draw = []
-        overlay = g.draw_overlay(preview_base, cand_xy_disp, T_hat_draw, matches_draw, title_text=title, gt_xy=None, match_tol=args.match_tol)
-        if args.pupil_roi_debug and roi_rect is not None:
-            ox, oy, sz = roi_rect
-            cv2.rectangle(
-                overlay,
-                (int(round(ox)), int(round(oy))),
-                (int(round(ox + sz)), int(round(oy + sz))),
-                (0, 200, 255),
-                2,
-            )
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         return {
-            "overlay_rgb": overlay_rgb,
-            "matches": matches_draw,
-            "cand_xy": cand_xy_disp,
+            "status": "ok",
             "cand_xy_base": cand_xy,
             "matches_base": matches,
             "T_hat": T_hat,
@@ -1411,14 +1998,15 @@ class PreviewApp:
             "inliers": inliers,
             "mean_err": mean_err,
             "roi_rect": roi_rect,
-            "overlay_key": self._overrides_key(fp.name),
-            "overlay_mode": "normal",
         }
 
-    def _invalidate_cache_for_frame(self, name: str) -> None:
+    def _invalidate_cache_for_frame(self, frame_id: str) -> None:
         with self.cache_lock:
-            if name in self.frame_cache:
-                self.frame_cache.pop(name, None)
+            self.compute_cache.pop(frame_id, None)
+            if self.overlay_cache:
+                stale = [key for key in self.overlay_cache.keys() if key[0] == frame_id]
+                for key in stale:
+                    self.overlay_cache.pop(key, None)
 
     def load_templates_json(self) -> None:
         path = filedialog.askopenfilename(
@@ -1655,6 +2243,8 @@ class PreviewApp:
         if bgr is None:
             return
         args = args_override if args_override is not None else self._get_args()
+        frame_id = self._frame_id(fp)
+        compute_key = self._compute_key(args)
         if bool(getattr(args, "mirror", False)):
             bgr = cv2.flip(bgr, 1)
         gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -1688,6 +2278,30 @@ class PreviewApp:
                 self.last_good_pupil,
             )
             if roi_decision.action == "skip":
+                entry = {
+                    "status": "skipped",
+                    "reason": "pupil_roi_skip",
+                    "cand_xy_base": np.empty((0, 2), dtype=float),
+                    "matches_base": [],
+                    "T_hat": None,
+                    "tracked_xy": None,
+                    "inliers": 0,
+                    "mean_err": float("nan"),
+                    "roi_rect": None,
+                }
+                with self.cache_lock:
+                    if compute_key == self.compute_key:
+                        self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+                if draw:
+                    overlay_rgb, matches_disp, cand_xy_disp, _overlay_hit = self._render_overlay_for_entry(
+                        fp, frame_id, entry, args, compute_key
+                    )
+                    self._set_canvas_rgb(overlay_rgb)
+                    self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (skipped)")
+                    self.current_fp = fp
+                    self.current_matches = matches_disp
+                    self.current_cand_xy = cand_xy_disp
+                    self._refresh_detection_list()
                 return
             if roi_decision.action == "use" and roi_decision.center is not None:
                 roi_info = compute_pupil_roi(
@@ -1703,30 +2317,6 @@ class PreviewApp:
                     self.last_good_pupil = (roi_decision.center[0], roi_decision.center[1], roi_decision.radius)
                 else:
                     self.last_good_pupil = (roi_decision.center[0], roi_decision.center[1], float("nan"))
-
-        preview_base = gray_full
-        if getattr(args, "preview_enhanced", False):
-            kernel_eff = int(params["kernel_eff"])
-            median_ksize_eff = int(params["median_ksize_eff"])
-            preview_base = g.enhance_for_glints(
-                gray_full,
-                kernel_size=kernel_eff,
-                median_ksize=median_ksize_eff,
-                clahe_clip=args.clahe_clip,
-                clahe_tiles=args.clahe_tiles,
-                denoise=int(getattr(args, "denoise", 1)),
-                denoise_k=int(getattr(args, "denoise_k", 0)),
-                clahe_enable=int(getattr(args, "clahe", 1)),
-                gamma=float(getattr(args, "gamma", 1.0)),
-                unsharp=int(getattr(args, "unsharp", 0)),
-                unsharp_amount=float(getattr(args, "unsharp_amount", 1.0)),
-                unsharp_sigma=float(getattr(args, "unsharp_sigma", 1.0)),
-                enhance_mode=str(getattr(args, "enhance_mode", "tophat")),
-                dog_sigma1=float(getattr(args, "dog_sigma1", 1.0)),
-                dog_sigma2=float(getattr(args, "dog_sigma2", 2.2)),
-                minmax=int(getattr(args, "minmax", 1)),
-                enhance_enable=int(getattr(args, "enhance_enable", 1)),
-            )
 
         cand_xy_pass0, rows_pass0, cand_score2_pass0, cand_raw_pass0, cand_support_pass0 = g.detect_candidates_one_pass(
             gray, params, args, d_expected=self.d_expected
@@ -1845,8 +2435,6 @@ class PreviewApp:
         else:
             self.template_by_image[fp.name] = np.full((best_template_xy.shape[0], 2), np.nan, dtype=float)
 
-        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
-
         tracked_xy = None
         if update_tracker and args.temporal:
             if self.temporal_tracker is None:
@@ -1856,18 +2444,22 @@ class PreviewApp:
                     max_missed=args.temporal_max_missed,
                 )
             meas_labeled = np.full((4, 2), np.nan, dtype=float)
-            for ti, ci, _ in matches_disp:
+            for ti, ci, _ in (matches or []):
                 if int(ti) >= 4:
                     continue
-                meas_labeled[int(ti)] = cand_xy_disp[int(ci)]
+                meas_labeled[int(ti)] = cand_xy[int(ci)]
             # If no labeled matches, fall back to top candidates (unordered)
-            if not np.isfinite(meas_labeled).any() and len(cand_xy_disp) > 0:
-                k = min(4, len(cand_xy_disp))
-                meas_labeled[:k] = cand_xy_disp[:k]
+            if not np.isfinite(meas_labeled).any() and len(cand_xy) > 0:
+                k = min(4, len(cand_xy))
+                meas_labeled[:k] = cand_xy[:k]
             # If still empty but we have a hypothesis, seed from T_hat
             if not np.isfinite(meas_labeled).any() and T_hat is not None and T_hat.shape[0] >= 4:
                 meas_labeled[:4] = T_hat[:4]
             tracked_xy, _meta = self.temporal_tracker.step_labeled(meas_labeled, frame_idx)
+
+        cand_xy_disp, matches_disp = self._apply_overrides(fp.name, cand_xy, matches, T_hat)
+
+        if update_tracker and args.temporal:
             if np.isfinite(tracked_xy).any():
                 self.glints_by_image[fp.name] = tracked_xy
             elif T_hat is not None:
@@ -1886,73 +2478,32 @@ class PreviewApp:
                     glint_xy[int(ti)] = cand_xy_disp[int(ci)]
             self.glints_by_image[fp.name] = glint_xy
 
-        if not draw:
-            return
-
-        title = f"{fp.name} | matcher={args.matcher} | inliers={inliers} | err={mean_err:.2f}px"
-        if args.temporal:
-            title += " | temporal"
         roi_rect = None
         if roi_info is not None:
             roi_rect = (float(roi_info.offset_x), float(roi_info.offset_y), float(int(args.pupil_roi_size)))
-        use_temporal_display = bool(args.temporal) and not self.corr_mode.get()
-        matches_draw = matches_disp
-        if not args.show_overlay:
-            overlay = cv2.cvtColor(preview_base, cv2.COLOR_GRAY2BGR)
-        else:
-            T_hat_draw = T_hat
-            if use_temporal_display and tracked_xy is not None:
-                if np.isfinite(tracked_xy).any():
-                    T_hat_draw = tracked_xy
-                    T_hat_draw = np.where(np.isfinite(T_hat_draw), T_hat_draw, -1e6)
-                matches_draw = []
-            overlay = g.draw_overlay(
-                preview_base,
-                cand_xy_disp,
-                T_hat_draw,
-                matches_draw,
-                title_text=title,
-                gt_xy=None,
-                match_tol=args.match_tol,
-            )
-        if args.pupil_roi_debug and roi_rect is not None:
-            ox, oy, sz = roi_rect
-            cv2.rectangle(
-                overlay,
-                (int(round(ox)), int(round(oy))),
-                (int(round(ox + sz)), int(round(oy + sz))),
-                (0, 200, 255),
-                2,
-            )
 
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-        cache_key = None
-        try:
-            cache_key = self._settings_cache_key(args)
-        except Exception:
-            cache_key = None
-        if cache_key is not None and cache_key == self.cache_key:
-            with self.cache_lock:
-                self.frame_cache[fp.name] = {
-                    "overlay_rgb": overlay_rgb,
-                    "matches": matches_disp if self.corr_mode.get() else matches_draw,
-                    "cand_xy": cand_xy_disp,
-                    "cand_xy_base": cand_xy,
-                    "matches_base": matches,
-                    "T_hat": T_hat,
-                    "tracked_xy": tracked_xy,
-                    "inliers": inliers,
-                    "mean_err": mean_err,
-                    "roi_rect": roi_rect,
-                    "overlay_key": self._overrides_key(fp.name),
-                    "overlay_mode": "corr" if self.corr_mode.get() else "normal",
-                }
-        self.current_preview_base = preview_base
-        self.current_preview_base_name = fp.name
-        self.current_preview_base_cache_key = cache_key
+        entry = {
+            "status": "ok",
+            "cand_xy_base": cand_xy,
+            "matches_base": matches,
+            "T_hat": T_hat,
+            "tracked_xy": tracked_xy,
+            "inliers": inliers,
+            "mean_err": mean_err,
+            "roi_rect": roi_rect,
+        }
+        with self.cache_lock:
+            if compute_key == self.compute_key:
+                self.compute_cache.setdefault(frame_id, {})[compute_key] = entry
+
+        if not draw:
+            return
+
+        overlay_rgb, matches_disp, cand_xy_disp, _overlay_hit = self._render_overlay_for_entry(
+            fp, frame_id, entry, args, compute_key
+        )
         self._set_canvas_rgb(overlay_rgb)
-
-        self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name}")
+        self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (computed)")
         self.current_fp = fp
         self.current_matches = matches_disp
         self.current_cand_xy = cand_xy_disp
@@ -1963,50 +2514,64 @@ class PreviewApp:
             return
         if not self.files:
             return
-        args, cache_key = self._get_args_and_cache_key()
-        if args.temporal and self.last_idx is not None and self.idx < self.last_idx:
+        args, compute_key = self._get_args_and_compute_key()
+        fp = self.files[self.idx]
+        frame_id = self._frame_id(fp)
+
+        entry = self._get_compute_entry(frame_id, compute_key)
+        if args.temporal and self.last_idx is not None and self.idx < self.last_idx and entry is None:
             self._reset_temporal()
             for i in range(self.idx):
                 self._process_frame(self.files[i], i, update_tracker=True, draw=False, args_override=args)
-        fp = self.files[self.idx]
-        if cache_key == self.cache_key:
-            with self.cache_lock:
-                entry = self.frame_cache.get(fp.name)
-            if entry is not None:
-                try:
-                    self._render_overlay_for_entry(fp, entry, args, cache_key)
-                except Exception:
-                    pass
-                overlay_rgb = entry.get("overlay_rgb")
-                if overlay_rgb is None:
-                    self._process_frame(fp, self.idx, update_tracker=True, draw=True)
-                    self.last_idx = self.idx
-                    return
-                self._set_canvas_rgb(overlay_rgb)
-                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (cached)")
-                self.current_fp = fp
-                self.current_matches = entry.get("matches", [])
-                self.current_cand_xy = entry.get("cand_xy", np.empty((0, 2), dtype=float))
-                self._refresh_detection_list()
+            entry = self._get_compute_entry(frame_id, compute_key)
+
+        if entry is not None:
+            try:
+                overlay_rgb, matches_disp, cand_xy_disp, overlay_hit = self._render_overlay_for_entry(
+                    fp, frame_id, entry, args, compute_key
+                )
+            except Exception:
+                _LOGGER.exception("Cached render failed for %s", frame_id)
+                overlay_rgb = None
+            if overlay_rgb is None:
+                self._process_frame(fp, self.idx, update_tracker=True, draw=True, args_override=args)
                 self.last_idx = self.idx
                 return
-            if self.cache_building:
-                self._start_ondemand_cache_compute(fp, self.idx, args, cache_key)
+            status_suffix = "cached overlay" if overlay_hit else "cached compute"
+            if entry.get("status") == "skipped":
+                status_suffix = "skipped"
+            self._set_canvas_rgb(overlay_rgb)
+            self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} ({status_suffix})")
+            self.current_fp = fp
+            self.current_matches = matches_disp
+            self.current_cand_xy = cand_xy_disp
+            self._refresh_detection_list()
+            self.last_idx = self.idx
+            return
+
+        with self.cache_lock:
+            cache_building = self.cache_building
+        if cache_building:
+            self._start_ondemand_cache_compute(fp, self.idx, args, compute_key)
+            quick_rgb = None
+            try:
+                preview_key = self._preview_key(args, compute_key)
+                if self.current_preview_base_name != fp.name or self.current_preview_base_cache_key != preview_key:
+                    quick_rgb = self._quick_preview_rgb(fp, args, preview_key)
+            except Exception:
+                _LOGGER.exception("Quick preview failed for %s", frame_id)
                 quick_rgb = None
-                try:
-                    if self.current_preview_base_name != fp.name or self.current_preview_base_cache_key != cache_key:
-                        quick_rgb = self._quick_preview_rgb(fp, args, cache_key)
-                except Exception:
-                    quick_rgb = None
-                if quick_rgb is not None:
-                    self._set_canvas_rgb(quick_rgb)
-                    self.current_fp = fp
-                    self.current_matches = []
-                    self.current_cand_xy = np.empty((0, 2), dtype=float)
-                    self._refresh_detection_list()
-                self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (caching...)")
-                self._request_render(100)
-                return
+            if quick_rgb is not None:
+                self._set_canvas_rgb(quick_rgb)
+                self.overlay_text_var.set(f"{fp.name} | caching…")
+                self.current_fp = fp
+                self.current_matches = []
+                self.current_cand_xy = np.empty((0, 2), dtype=float)
+                self._refresh_detection_list()
+            self.status_var.set(f"{self.idx+1}/{len(self.files)}: {fp.name} (caching...)")
+            self._request_render(100)
+            return
+
         self._process_frame(fp, self.idx, update_tracker=True, draw=True, args_override=args)
         self.last_idx = self.idx
 
@@ -2280,5 +2845,59 @@ def main() -> None:
     root.mainloop()
 
 
+def _run_self_checks() -> bool:
+    ok = True
+    print("Running cache self-checks...")
+
+    # 1) Frame id should be unique for same filename in different folders.
+    base_dir = Path(tempfile.mkdtemp())
+    a = base_dir / "a" / "0001.png"
+    b = base_dir / "b" / "0001.png"
+    a.parent.mkdir(parents=True, exist_ok=True)
+    b.parent.mkdir(parents=True, exist_ok=True)
+    frame_id_a = str(a.resolve())
+    frame_id_b = str(b.resolve())
+    if frame_id_a == frame_id_b:
+        print("FAIL: frame_id collision for different paths.")
+        ok = False
+    else:
+        print("OK: frame_id uniqueness.")
+
+    # 2) Overlay-only changes should not change compute key.
+    base_args = types.SimpleNamespace(
+        matcher="sla",
+        template_mode="single",
+        score2_mode="contrast_support",
+        percentile=99.5,
+        kernel=11,
+        median_ksize=3,
+        eps=6.0,
+    )
+    key_base = _hash_payload(_compute_key_payload(base_args, None, None, None))
+    overlay_args = types.SimpleNamespace(**vars(base_args))
+    overlay_args.show_overlay = False
+    overlay_args.preview_enhanced = True
+    key_overlay = _hash_payload(_compute_key_payload(overlay_args, None, None, None))
+    if key_base != key_overlay:
+        print("FAIL: overlay-only change altered compute key.")
+        ok = False
+    else:
+        print("OK: overlay-only change does not affect compute key.")
+
+    # 3) Compute parameter change should alter compute key.
+    changed_args = types.SimpleNamespace(**vars(base_args))
+    changed_args.eps = 7.0
+    key_changed = _hash_payload(_compute_key_payload(changed_args, None, None, None))
+    if key_base == key_changed:
+        print("FAIL: compute parameter change did not alter compute key.")
+        ok = False
+    else:
+        print("OK: compute parameter change alters compute key.")
+
+    return ok
+
+
 if __name__ == "__main__":
+    if "--self-check" in sys.argv:
+        raise SystemExit(0 if _run_self_checks() else 1)
     main()
