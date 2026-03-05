@@ -79,10 +79,10 @@ Review and correct annotations by using:
 ```bash
 python glint_pupil_annotation_review_ui.py --help
 ```
-Pre-generated annotations can be found in the Zenodo repository (see above)
+Pre-generated annotations for OpenEDS2019 [1] and OpenEDS2020 [2] Sparse Segmentation can be found in the Zenodo repository (see above)
 
 
-Manual template maker -- if trying out on a different dataset, you can create your template by loading an example image from the dataset that shows all glints you need to detect and manually assigning each glint with a label: 
+Manual template maker -- if trying out on a dataset with different LED setup, you can create your template by loading an example image from the dataset that shows all glints you need to detect and manually assigning each glint with a label: 
 
 ```bash
 python templatemaker_manual.py
