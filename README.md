@@ -132,10 +132,10 @@ csv/        # Evaluation metrics for downstream analysis
 
 
 ## To-Do's 
-⏳ optimize glint UI
-⏳ add stereo capabilities
-⏳ improve Correction mode
-⏳ improve built-in pupil detection methods
+- ⏳ optimize glint UI
+- ⏳ add stereo capabilities
+- ⏳ improve Correction model
+- ⏳ improve built-in pupil detection methods
 
 ## Reproducibility
 
