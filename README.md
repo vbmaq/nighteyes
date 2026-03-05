@@ -1,4 +1,4 @@
-# Glint Constellation Pipeline
+# Night Eyes Glint Constellation Pipeline
 
 Reference implementation of a constellation-based corneal reflection ("glint") detection and correspondence pipeline for multi-LED eye-tracking systems.
 
