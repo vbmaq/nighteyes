@@ -149,7 +149,7 @@ If you used our work, please cite this paper:
 
 ## License
 
-License is currently unspecified.
+This code is licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
 
 ## Acknowledgements
 
